@@ -53,7 +53,11 @@ def _run_epoch(
         if train:
             assert optimizer is not None
             optimizer.zero_grad(set_to_none=True)
-            out = elbo_fn(x_masked, m, beta=beta)
+            # Prefer supervised loss on masked (missing) positions when x_true is provided and there are misses.
+            if (len(batch) == 3) and torch.any(m <= 0.5):
+                out = model.elbo_sequence_supervised(x_masked, m, x_true, supervise='miss', beta=beta)
+            else:
+                out = elbo_fn(x_masked, m, beta=beta)
             loss = out['loss']
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -67,7 +71,10 @@ def _run_epoch(
                 total_mse_obs += metrics['mse_obs'].mean().to(dtype=total_loss.dtype)
                 num_batches += 1
         else:
-            out = elbo_fn(x_masked, m, beta=beta)
+            if (len(batch) == 3) and torch.any(m <= 0.5):
+                out = model.elbo_sequence_supervised(x_masked, m, x_true, supervise='miss', beta=beta)
+            else:
+                out = elbo_fn(x_masked, m, beta=beta)
             metrics = batch_metrics(out['mean'], out['logvar_x'], x_true, m)
             total_loss += out['loss'].detach().to(dtype=total_loss.dtype)
             total_nll += out['nll'].detach().to(dtype=total_loss.dtype)
@@ -130,18 +137,4 @@ class OnlineTrainer:
             train=False,
         )
 
-    @torch.no_grad()
-    def impute_loader(self, loader: DataLoader) -> torch.Tensor:
-        self.model.eval()
-        outs = []
-        for batch in loader:
-            if len(batch) == 3:
-                x_masked, m, _ = batch
-            elif len(batch) == 2:
-                x_masked, m = batch
-            else:
-                raise ValueError('Expected batch of 2 or 3 tensors')
-            x_masked, m = self._to_device(x_masked.float(), m.float())
-            imputed = self.model.impute_online(x_masked, m, use_mean=True)
-            outs.append(imputed.cpu())
-        return torch.cat(outs, dim=0)
+    # No legacy bulk-imputation APIs are provided.

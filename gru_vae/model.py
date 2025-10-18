@@ -150,8 +150,60 @@ class OnlineGPVAE(nn.Module):
             'logvar': logvar_seq,
         }
 
+    def elbo_sequence_supervised(
+        self,
+        x_input: torch.Tensor,
+        mask_keep: torch.Tensor,
+        x_target: torch.Tensor,
+        *,
+        supervise: str = 'miss',
+        beta: Optional[float] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """ELBO with decoupled input/target for self-supervised training.
+
+        - Encoder/step consumes `x_input` with `mask_keep`.
+        - NLL is computed against `x_target` using either observed (keep) or
+          missing (1-keep) positions depending on `supervise`.
+        """
+        if not (x_input.shape == mask_keep.shape == x_target.shape):
+            raise ValueError('x_input, mask_keep, x_target must share shape [B,T,H]')
+        B, T, H = x_input.shape
+        if H != self.output_dim:
+            raise ValueError('x_input.shape[2] does not match model output_dim')
+        device, dtype = x_input.device, x_input.dtype
+        state = self.init_state(B, device=device, dtype=dtype)
+        mean_seq = torch.empty(B, T, H, device=device, dtype=dtype)
+        logvar_x_seq = torch.empty_like(mean_seq)
+        mu_seq = torch.empty(B, self.latent_dim, T, device=device, dtype=dtype)
+        logvar_seq = torch.empty_like(mu_seq)
+        kl_acc = torch.zeros(B, device=device, dtype=dtype)
+        for t in range(T):
+            x_t = x_input[:, t, :]
+            m_t = mask_keep[:, t, :]
+            _yhat_t, state, aux = self.step(x_t, m_t, state, use_mean=False)
+            mean_seq[:, t, :] = aux['mean_t']
+            logvar_x_seq[:, t, :] = aux['logvar_x_t']
+            mu_seq[:, :, t] = aux['mu_t']
+            logvar_seq[:, :, t] = aux['logvar_t']
+            kl_acc += aux['kl_t']
+        if supervise not in ('obs', 'miss'):
+            raise ValueError("supervise must be 'obs' or 'miss'")
+        mask_loss = mask_keep if supervise == 'obs' else (mask_keep <= 0.5).to(dtype=mask_keep.dtype)
+        nll_b = gaussian_nll_observed(mean_seq, logvar_x_seq, x_target, mask_loss)
+        beta_val = float(self.beta if beta is None else beta)
+        loss_b = nll_b + beta_val * kl_acc
+        return {
+            'loss': loss_b.mean(),
+            'nll': nll_b.mean(),
+            'kl': kl_acc.mean(),
+            'mean': mean_seq,
+            'logvar_x': logvar_x_seq,
+            'mu': mu_seq,
+            'logvar': logvar_seq,
+        }
+
     @torch.no_grad()
-    def impute_online(self, x: torch.Tensor, mask: torch.Tensor, use_mean: bool = True) -> torch.Tensor:
+    def reconstruct_online(self, x: torch.Tensor, mask: torch.Tensor, use_mean: bool = True) -> torch.Tensor:
         if x.ndim != 3 or mask.ndim != 3 or x.shape != mask.shape:
             raise ValueError('x and mask must have shape [B,T,H] and match')
         B, T, H = x.shape

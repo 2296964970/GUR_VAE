@@ -27,7 +27,7 @@ def main() -> None:
     p.add_argument('--stride', type=int, default=48)
     p.add_argument('--batch_size', type=int, default=64)
     p.add_argument('--mask_rate', type=float, default=0.3)
-    p.add_argument('--mask_mode', type=str, default='iid', choices=['iid', 'block', 'corr'])
+    p.add_argument('--mask_mode', type=str, default='iid', choices=['iid', 'block', 'corr', 'point', 'window'])
     # Block mask params
     p.add_argument('--block_t_min', type=int, default=2)
     p.add_argument('--block_t_max', type=int, default=8)
@@ -37,6 +37,15 @@ def main() -> None:
     # Correlated mask params
     p.add_argument('--corr_t', type=int, default=7)
     p.add_argument('--corr_f', type=int, default=15)
+    # Input noise corruption (always applied on selected masked positions)
+    p.add_argument('--noise_kind', type=str, default='gaussian', choices=['gaussian', 'bias', 'scale', 'spike'])
+    p.add_argument('--noise_sigma', type=float, default=1.0)
+    p.add_argument('--noise_bias_min', type=float, default=-1.0)
+    p.add_argument('--noise_bias_max', type=float, default=1.0)
+    p.add_argument('--noise_scale_min', type=float, default=0.5)
+    p.add_argument('--noise_scale_max', type=float, default=1.5)
+    p.add_argument('--noise_amp_min', type=float, default=3.0)
+    p.add_argument('--noise_amp_max', type=float, default=6.0)
     p.add_argument('--mask_seed', type=int, default=1337)
     # Model (GRU-only)
     p.add_argument('--latent_dim', type=int, default=32)
@@ -76,6 +85,14 @@ def main() -> None:
         block_max_blocks=args.block_max_blocks,
         corr_t=args.corr_t,
         corr_f=args.corr_f,
+        noise_kind=args.noise_kind,
+        noise_sigma=args.noise_sigma,
+        noise_bias_min=args.noise_bias_min,
+        noise_bias_max=args.noise_bias_max,
+        noise_scale_min=args.noise_scale_min,
+        noise_scale_max=args.noise_scale_max,
+        noise_amp_min=args.noise_amp_min,
+        noise_amp_max=args.noise_amp_max,
         seed=args.mask_seed,
     )
 

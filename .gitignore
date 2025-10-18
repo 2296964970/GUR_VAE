@@ -45,3 +45,6 @@ Thumbs.db
 tmp_*
 temp_*
 *.tmp
+
+# Experiment logs and plots
+experiment_logs/

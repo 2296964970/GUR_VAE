@@ -4,7 +4,7 @@ Pipeline (best-only implementation):
 - Calibrate per-feature thresholds on Normal tail NLL at (1-alpha) quantile
   (with global-quantile fallback for sparse features).
 - For Tail-Only window [s,e), compute tail NLL at e-1, threshold to predict anomalies,
-  hard-mask predicted anomalies at the tail, and impute via Online GP-VAE.
+  hard-mask predicted anomalies at the tail, and reconstruct via Online GP-VAE.
 - Monte Carlo averaging with 16 samples (fixed) is used during imputation to improve stability.
   Evaluate repair quality against the clean baseline over observed tail features.
 
@@ -176,14 +176,14 @@ def _apply_thresholds(scores_tail: np.ndarray, m_tail: np.ndarray, meta: Dict[st
 MC_SAMPLES = 16
 
 
-def _impute_tail(
+def _reconstruct_tail(
     model: OnlineGPVAE,
     x_w: np.ndarray,
     m_w: np.ndarray,
     *,
     device: torch.device,
 ) -> np.ndarray:
-    """Impute tail-window with optional Monte Carlo averaging on latent samples.
+    """Reconstruct tail-window with optional Monte Carlo averaging on latent samples.
 
     - mc_samples=1: deterministic mean-path imputation.
     - mc_samples>1: average over stochastic paths (use_mean=False) to reduce variance.
@@ -195,7 +195,7 @@ def _impute_tail(
         acc = None
         S = int(MC_SAMPLES)
         for _ in range(S):
-            ys = model.impute_online(xb, mb, use_mean=False)
+            ys = model.reconstruct_online(xb, mb, use_mean=False)
             ys_np = ys.squeeze(0).cpu().numpy().astype(np.float64)
             if acc is None:
                 acc = ys_np
@@ -247,6 +247,26 @@ def main() -> None:
     # Thresholds
     p.add_argument('--alpha', type=float, default=0.01)
     p.add_argument('--min_count_per_feature', type=int, default=100)
+    # Diagnostics
+    p.add_argument('--print_topk', dest='print_topk', action='store_true', help='Print top-K tail scores per step')
+    p.add_argument('--no-print_topk', dest='print_topk', action='store_false')
+    p.set_defaults(print_topk=False)
+    p.add_argument('--topk', type=int, default=20, help='Top-K features by tail score to display when --print_topk is set')
+    p.add_argument('--dump_thresholds', type=str, default='', help='Path to save per-feature thresholds CSV')
+    p.add_argument('--dump_tail_scores_dir', type=str, default='', help='Directory to save per-step tail score CSVs')
+    # Tail-scores wide-format options
+    p.add_argument('--tail_scores_wide', dest='tail_scores_wide', action='store_true',
+                   help='Also emit a wide CSV where each row is a timestamp and each column is a feature')
+    p.add_argument('--no-tail_scores_wide', dest='tail_scores_wide', action='store_false')
+    p.set_defaults(tail_scores_wide=False)
+    p.add_argument('--tail_scores_value', type=str, default='score',
+                   choices=['score', 'threshold', 'keep_pred', 'is_anom'],
+                   help='Which value to emit in wide tail-scores: raw score, per-feature threshold, keep_pred (1/0), or is_anom (1/0)')
+    p.add_argument('--print_drop_metrics', dest='print_drop_metrics', action='store_true', help='Print drop-only metrics in summary')
+    p.add_argument('--no-print_drop_metrics', dest='print_drop_metrics', action='store_false')
+    p.set_defaults(print_drop_metrics=True)
+    # Output naming
+    p.add_argument('--out_suffix', type=str, default='', help='Optional suffix to append to output CSV filenames')
     # Model
     p.add_argument('--latent_dim', type=int, default=32)
     p.add_argument('--dec_hidden', type=str, default='256,256')
@@ -350,6 +370,15 @@ def main() -> None:
         model, Xn_std, Mn_struct_f, L, batch_size=args.batch_size, device=device,
         alpha=args.alpha, min_count_per_feature=args.min_count_per_feature, feature_names=feat_names,
     )
+    # Optionally dump thresholds to CSV
+    if args.dump_thresholds:
+        thr_map: Dict[str, float] = thresholds_meta['thresholds']  # type: ignore[index]
+        df_thr = pd.DataFrame({
+            'feature': feat_names,
+            'threshold': [float(thr_map[name]) for name in feat_names],
+        })
+        df_thr.to_csv(args.dump_thresholds, index=False, encoding='utf-8')
+        print(f"[ok] Saved thresholds CSV: {args.dump_thresholds} (features={len(df_thr)})")
 
     sliding_steps = int(args.sliding_steps)
     max_tail_idx = t + sliding_steps - 1
@@ -398,15 +427,93 @@ def main() -> None:
             raise SystemExit(f'[error] Sliding step {step_offset} (tail index {tail_idx}) has no observed tail features')
         is_anom = (pred_tail == 0.0) & m_tail_obs
         m_imp[-1, is_anom] = 0.0
+        # Diagnostics: Top-K printing and per-step tail scores dump
+        if args.print_topk and args.topk > 0:
+            obs_idx_arr = np.where(m_tail_obs)[0]
+            if obs_idx_arr.size > 0:
+                thr_map: Dict[str, float] = thresholds_meta['thresholds']  # type: ignore[index]
+                scores_obs = scores_tail[obs_idx_arr]
+                names_obs = [feat_names[i] for i in obs_idx_arr]
+                order = np.argsort(-scores_obs)  # descending
+                k = int(min(args.topk, order.size))
+                print(f"[debug] Top-{k} tail scores at step {step_offset} (tail idx {tail_idx}):")
+                for rank in range(k):
+                    j = int(order[rank])
+                    name = names_obs[j]
+                    sc = float(scores_obs[j])
+                    tau = float(thr_map[name])
+                    keep_pred = int(sc <= tau)
+                    print(f"  #{rank+1:02d} {name:>20s}  score={sc:.6f}  thr={tau:.6f}  keep_pred={keep_pred}")
+        if args.dump_tail_scores_dir:
+            os.makedirs(args.dump_tail_scores_dir, exist_ok=True)
+            thr_map: Dict[str, float] = thresholds_meta['thresholds']  # type: ignore[index]
+            # Always emit wide-format CSV only: one row per timestamp, columns match input features
+            kind = str(args.tail_scores_value) if hasattr(args, 'tail_scores_value') else 'score'
+            if kind == 'score':
+                vals = scores_tail.astype(np.float64)
+            elif kind == 'threshold':
+                vals = np.asarray([float(thr_map[name]) for name in feat_names], dtype=np.float64)
+            elif kind == 'keep_pred':
+                vals = (scores_tail <= np.asarray([thr_map[name] for name in feat_names], dtype=np.float64)).astype(np.float64)
+            else:  # 'is_anom'
+                vals = is_anom.astype(np.float64)
+            header = [ts_col] + list(feat_names)
+            row_vals = [timestamp_str] + [float(x) for x in vals.tolist()]
+            out_wide = os.path.join(args.dump_tail_scores_dir, f"tail_scores_wide_{kind}.csv")
+            need_header = not os.path.exists(out_wide)
+            with open(out_wide, 'a', encoding='utf-8') as fw:
+                if need_header:
+                    fw.write(','.join(header) + '\n')
+                fw.write(','.join(str(v) for v in row_vals) + '\n')
+            print(f"[ok] Appended wide tail scores ({kind}) to: {out_wide}")
         x_in = np.where(m_imp > 0.5, X_T_std, 0.0).astype(np.float32)
-        y_std = _impute_tail(model, x_in, m_imp, device=device)
+        y_std = _reconstruct_tail(model, x_in, m_imp, device=device)
         y = y_std * std_safe + mean
         current_stream[tail_idx] = y[-1].astype(np.float32)
         repaired_tail_rows.append((tail_idx, timestamp_str, y[-1].astype(np.float64)))
         repaired_mask[tail_idx] = True
 
+        # Also append repaired values (wide format): one row per timestamp, columns match input features
+        if args.dump_tail_scores_dir:
+            try:
+                os.makedirs(args.dump_tail_scores_dir, exist_ok=True)
+            except Exception:
+                pass
+            out_repaired = os.path.join(args.dump_tail_scores_dir, 'tail_repaired_wide.csv')
+            header_rep = [ts_col] + list(feat_names)
+            need_header_rep = not os.path.exists(out_repaired)
+            y_tail_vec = y[-1].astype(np.float64)
+            row_rep = [timestamp_str] + [float(v) for v in y_tail_vec.tolist()]
+            with open(out_repaired, 'a', encoding='utf-8') as fw:
+                if need_header_rep:
+                    fw.write(','.join(header_rep) + '\n')
+                fw.write(','.join(str(v) for v in row_rep) + '\n')
+
         x_true_tail = Xn[tail_idx].astype(np.float64)
         x_att_tail = Xa[tail_idx].astype(np.float64)
+        # Also append attacked/true values as wide CSVs for side-by-side comparison
+        if args.dump_tail_scores_dir:
+            try:
+                os.makedirs(args.dump_tail_scores_dir, exist_ok=True)
+            except Exception:
+                pass
+            header_w = [ts_col] + list(feat_names)
+            # attacked
+            out_att = os.path.join(args.dump_tail_scores_dir, 'tail_attacked_wide.csv')
+            if not os.path.exists(out_att):
+                with open(out_att, 'w', encoding='utf-8') as fw:
+                    fw.write(','.join(header_w) + '\n')
+            row_att = [timestamp_str] + [float(v) for v in x_att_tail.tolist()]
+            with open(out_att, 'a', encoding='utf-8') as fw:
+                fw.write(','.join(str(v) for v in row_att) + '\n')
+            # true (clean baseline)
+            out_true = os.path.join(args.dump_tail_scores_dir, 'tail_true_wide.csv')
+            if not os.path.exists(out_true):
+                with open(out_true, 'w', encoding='utf-8') as fw:
+                    fw.write(','.join(header_w) + '\n')
+            row_true = [timestamp_str] + [float(v) for v in x_true_tail.tolist()]
+            with open(out_true, 'a', encoding='utf-8') as fw:
+                fw.write(','.join(str(v) for v in row_true) + '\n')
         y_tail = y[-1].astype(np.float64)
         mask_idx = m_tail_obs
         err_att = x_att_tail[mask_idx] - x_true_tail[mask_idx]
@@ -433,6 +540,20 @@ def main() -> None:
         rim_mse = rel_improve(mse, mse_b) if mse_b > 1e-12 else float('nan')
         rim_rmse = rel_improve(rmse, rmse_b) if rmse_b > 1e-12 else float('nan')
 
+        # Drop-only metrics: evaluate reconstruction only over predicted dropped features
+        if drop_count > 0:
+            mask_idx_drop = is_anom
+            err_rep_d = y_tail[mask_idx_drop] - x_true_tail[mask_idx_drop]
+            mse_drop = float(np.mean(err_rep_d ** 2))
+            rmse_drop = float(np.sqrt(mse_drop))
+            std_tail_d = std_map[mask_idx_drop]
+            std_tail_d = np.where(std_tail_d > 0.0, std_tail_d, 1.0)
+            nrmse_drop = float(np.sqrt(np.mean((err_rep_d / std_tail_d) ** 2)))
+        else:
+            mse_drop = float('nan')
+            rmse_drop = float('nan')
+            nrmse_drop = float('nan')
+
         step_results.append({
             'step': step_offset,
             'tail_idx': tail_idx,
@@ -454,6 +575,9 @@ def main() -> None:
             'nmae_b': nmae_b,
             'rim_mse': rim_mse,
             'rim_rmse': rim_rmse,
+            'mse_drop': mse_drop,
+            'rmse_drop': rmse_drop,
+            'nrmse_drop': nrmse_drop,
         })
 
         print(
@@ -464,9 +588,10 @@ def main() -> None:
 
     # Always save only repaired tail rows (one row per sliding step)
     base = os.path.splitext(os.path.basename(attacked_csv))[0]
+    suffix = ("_" + args.out_suffix.strip()) if args.out_suffix and args.out_suffix.strip() else ""
     out_tail_csv = os.path.join(
         os.path.dirname(attacked_csv),
-        f"{base}_repaired_tail_rows_L{L}_steps{sliding_steps}.csv",
+        f"{base}_repaired_tail_rows_L{L}_steps{sliding_steps}{suffix}.csv",
     )
     if repaired_tail_rows:
         stamps = [it[1] for it in repaired_tail_rows]
@@ -482,17 +607,24 @@ def main() -> None:
     header = (
         "Step  TailIdx  Timestamp        Obs    Dropped  DropRate(%)  "
         "MSE_att     MSE_rep     RMSE_att    RMSE_rep    NRMSE_att   NRMSE_rep   "
-        "Rel.Improv_MSE(%)  Rel.Improv_RMSE(%)"
+        "Rel.Improv_MSE(%)  Rel.Improv_RMSE(%)  MSE_rep@Drop  RMSE_rep@Drop  NRMSE_rep@Drop"
     )
     print(header)
     for res in step_results:
         rim_mse = res['rim_mse']
         rim_rmse = res['rim_rmse']
+        mse_drop = res.get('mse_drop', float('nan'))
+        rmse_drop = res.get('rmse_drop', float('nan'))
+        nrmse_drop = res.get('nrmse_drop', float('nan'))
+        mse_drop_s = f"{mse_drop:.6f}" if np.isfinite(mse_drop) else "   nan  "
+        rmse_drop_s = f"{rmse_drop:.6f}" if np.isfinite(rmse_drop) else "   nan  "
+        nrmse_drop_s = f"{nrmse_drop:.6f}" if np.isfinite(nrmse_drop) else "   nan  "
         print(
             f"{res['step']:4d}  {res['tail_idx']:7d}  {res['timestamp']:16s}  "
             f"{res['obs_count']:6d}  {res['drop_count']:7d}  {res['drop_rate']:11.2f}  "
             f"{res['mse_b']:10.6f} {res['mse']:10.6f} {res['rmse_b']:11.6f} {res['rmse']:11.6f} "
-            f"{res['nrmse_b']:10.6f} {res['nrmse']:10.6f} {rim_mse:18.2f} {rim_rmse:18.2f}"
+            f"{res['nrmse_b']:10.6f} {res['nrmse']:10.6f} {rim_mse:18.2f} {rim_rmse:18.2f}  "
+            f"{mse_drop_s:>12s} {rmse_drop_s:>14s} {nrmse_drop_s:>14s}"
         )
 
     if step_results:
@@ -507,6 +639,24 @@ def main() -> None:
             f"MSE_att={mse_b_mean:.6f}, MSE_rep={mse_mean:.6f}, RMSE_att={rmse_b_mean:.6f}, "
             f"RMSE_rep={rmse_mean:.6f}, Gain_MSE={agg_gain_mse:.2f}%, Gain_RMSE={agg_gain_rmse:.2f}%"
         )
+        # Drop-only aggregates
+        mse_drop_vals = [res.get('mse_drop', float('nan')) for res in step_results]
+        rmse_drop_vals = [res.get('rmse_drop', float('nan')) for res in step_results]
+        nrmse_drop_vals = [res.get('nrmse_drop', float('nan')) for res in step_results]
+        arr_m = np.asarray(mse_drop_vals, dtype=np.float64)
+        arr_r = np.asarray(rmse_drop_vals, dtype=np.float64)
+        arr_n = np.asarray(nrmse_drop_vals, dtype=np.float64)
+        m_m = np.isfinite(arr_m)
+        m_r = np.isfinite(arr_r)
+        m_n = np.isfinite(arr_n)
+        if args.print_drop_metrics and (np.any(m_m) or np.any(m_r) or np.any(m_n)):
+            mse_drop_mean = float(np.mean(arr_m[m_m])) if np.any(m_m) else float('nan')
+            rmse_drop_mean = float(np.mean(arr_r[m_r])) if np.any(m_r) else float('nan')
+            nrmse_drop_mean = float(np.mean(arr_n[m_n])) if np.any(m_n) else float('nan')
+            print(
+                f"Drop-Only Aggregate: MSE_rep@Drop={mse_drop_mean:.6f}, "
+                f"RMSE_rep@Drop={rmse_drop_mean:.6f}, NRMSE_rep@Drop={nrmse_drop_mean:.6f}"
+            )
 
 
 if __name__ == '__main__':

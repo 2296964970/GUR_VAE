@@ -89,16 +89,29 @@ class SelfSupervisedMaskingDataset(SlidingWindowDataset):
                  block_f_min: int = 4, block_f_max: int = 32,
                  block_max_blocks: int = 4,
                  # corr mode params (odd kernel recommended)
-                 corr_t: int = 7, corr_f: int = 15) -> None:
+                 corr_t: int = 7, corr_f: int = 15,
+                 # input noise corruption (always applied on selected masked positions)
+                 noise_kind: str = 'gaussian',
+                 noise_sigma: float = 1.0,
+                 noise_bias_min: float = -1.0, noise_bias_max: float = 1.0,
+                 noise_scale_min: float = 0.5, noise_scale_max: float = 1.5,
+                 noise_amp_min: float = 3.0, noise_amp_max: float = 6.0,
+                 ) -> None:
         super().__init__(x, m_struct, window, stride)
         if not (0.0 <= float(mask_rate) < 1.0):
             raise ValueError('mask_rate must satisfy 0 <= rate < 1')
         self.mask_rate = float(mask_rate)
         self._base_seed = int(seed) if seed is not None else None
         self._gen: Optional[torch.Generator] = None
-        self.mask_mode = str(mask_mode).lower()
+        # Support aliases: point->iid, window->block
+        mm = str(mask_mode).lower()
+        if mm == 'point':
+            mm = 'iid'
+        elif mm == 'window':
+            mm = 'block'
+        self.mask_mode = mm
         if self.mask_mode not in ('iid', 'block', 'corr'):
-            raise ValueError("mask_mode must be one of: 'iid', 'block', 'corr'")
+            raise ValueError("mask_mode must be one of: 'iid', 'block', 'corr', or aliases 'point'/'window'")
         # block params
         self.block_t_min = int(block_t_min)
         self.block_t_max = int(block_t_max)
@@ -108,12 +121,21 @@ class SelfSupervisedMaskingDataset(SlidingWindowDataset):
         # corr params
         self.corr_t = int(corr_t)
         self.corr_f = int(corr_f)
+        # noise params (always enabled on selected masked positions)
+        self.noise_kind = str(noise_kind).lower()
+        self.noise_sigma = float(noise_sigma)
+        self.noise_bias_min = float(noise_bias_min)
+        self.noise_bias_max = float(noise_bias_max)
+        self.noise_scale_min = float(noise_scale_min)
+        self.noise_scale_max = float(noise_scale_max)
+        self.noise_amp_min = float(noise_amp_min)
+        self.noise_amp_max = float(noise_amp_max)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         xw, m_struct_w = super().__getitem__(idx)
         if self.mask_rate == 0.0:
-            x_masked = torch.where(m_struct_w > 0.5, xw, torch.zeros_like(xw))
-            return x_masked, m_struct_w, xw
+            # No selected masked positions -> feed original (structurally observed) values as input
+            return xw, m_struct_w, xw
         if self._gen is None and self._base_seed is not None:
             info = torch.utils.data.get_worker_info()
             worker_id = info.id if info is not None else 0
@@ -130,34 +152,63 @@ class SelfSupervisedMaskingDataset(SlidingWindowDataset):
             m_sampled = m_struct_w * keep
         elif mode == 'block':
             L, H = m_struct_w.shape
-            # approximate number of blocks to hit target rate
-            avg_area = max((self.block_t_min + self.block_t_max) * 0.5, 1.0) * max((self.block_f_min + self.block_f_max) * 0.5, 1.0)
-            target_drop = int(self.mask_rate * L * H)
-            n_blocks = max(int(round(target_drop / max(avg_area, 1.0))), 1) if target_drop > 0 else 0
-            if self.block_max_blocks > 0:
-                n_blocks = min(n_blocks, self.block_max_blocks)
-            drop = torch.zeros_like(m_struct_w)
-            gen = self._gen
-            for _ in range(n_blocks):
-                # sizes
-                if gen is not None:
-                    rt = int(torch.randint(low=self.block_t_min, high=max(self.block_t_max, self.block_t_min + 1), size=(1,), generator=gen).item())
-                    rf = int(torch.randint(low=self.block_f_min, high=max(self.block_f_max, self.block_f_min + 1), size=(1,), generator=gen).item())
-                else:
-                    rt = int(np.random.randint(self.block_t_min, max(self.block_t_max, self.block_t_min + 1)))
-                    rf = int(np.random.randint(self.block_f_min, max(self.block_f_max, self.block_f_min + 1)))
-                rt = max(1, min(rt, L))
-                rf = max(1, min(rf, H))
-                # positions
-                if gen is not None:
-                    t0 = int(torch.randint(low=0, high=max(L - rt + 1, 1), size=(1,), generator=gen).item())
-                    f0 = int(torch.randint(low=0, high=max(H - rf + 1, 1), size=(1,), generator=gen).item())
-                else:
-                    t0 = int(np.random.randint(0, max(L - rt + 1, 1)))
-                    f0 = int(np.random.randint(0, max(H - rf + 1, 1)))
-                drop[t0:t0+rt, f0:f0+rf] = 1.0
-            keep = (1.0 - drop).to(m_struct_w.dtype)
-            m_sampled = m_struct_w * keep
+            # target drop only counts structurally observed cells
+            struct = (m_struct_w > 0.5).to(dtype=torch.float32)
+            obs_count = float(struct.sum().item())
+            target_drop = float(self.mask_rate) * obs_count
+            if target_drop <= 0.0 or obs_count <= 0.0:
+                m_sampled = m_struct_w.clone()
+            else:
+                # iteratively place windows until approaching target; then top-up with iid if needed
+                avg_area = max((self.block_t_min + self.block_t_max) * 0.5, 1.0) * max((self.block_f_min + self.block_f_max) * 0.5, 1.0)
+                approx_blocks = int(np.ceil(target_drop / max(avg_area, 1.0)))
+                max_blocks = int(self.block_max_blocks) if self.block_max_blocks > 0 else int(approx_blocks * 4 + 10)
+                drop = torch.zeros_like(m_struct_w, dtype=torch.float32)
+                gen = self._gen
+                placed = 0
+                attempts = 0
+                max_attempts = max(max_blocks * 5, 50)
+                while placed < max_blocks and attempts < max_attempts:
+                    attempts += 1
+                    # sizes (clamped by window size)
+                    if gen is not None:
+                        rt = int(torch.randint(low=self.block_t_min, high=max(self.block_t_max, self.block_t_min + 1), size=(1,), generator=gen).item())
+                        rf = int(torch.randint(low=self.block_f_min, high=max(self.block_f_max, self.block_f_min + 1), size=(1,), generator=gen).item())
+                    else:
+                        rt = int(np.random.randint(self.block_t_min, max(self.block_t_max, self.block_t_min + 1)))
+                        rf = int(np.random.randint(self.block_f_min, max(self.block_f_max, self.block_f_min + 1)))
+                    rt = max(1, min(rt, int(L)))
+                    rf = max(1, min(rf, int(H)))
+                    # positions
+                    if gen is not None:
+                        t0 = int(torch.randint(low=0, high=max(int(L) - rt + 1, 1), size=(1,), generator=gen).item())
+                        f0 = int(torch.randint(low=0, high=max(int(H) - rf + 1, 1), size=(1,), generator=gen).item())
+                    else:
+                        t0 = int(np.random.randint(0, max(int(L) - rt + 1, 1)))
+                        f0 = int(np.random.randint(0, max(int(H) - rf + 1, 1)))
+                    drop[t0:t0+rt, f0:f0+rf] = 1.0
+                    placed += 1
+                    # check progress periodically to avoid excessive loops
+                    if placed % 2 == 0 or placed >= max_blocks:
+                        cur_drop = (drop * struct).sum().item()
+                        if cur_drop >= target_drop:
+                            break
+                # top-up with iid on remaining observed cells if still under target
+                cur_drop = (drop * struct).sum().item()
+                if cur_drop < target_drop:
+                    remain = (struct * (1.0 - drop))
+                    remain_count = float(remain.sum().item())
+                    need = max(target_drop - cur_drop, 0.0)
+                    if remain_count > 0.0 and need > 0.0:
+                        p_extra = min(max(need / remain_count, 0.0), 1.0)
+                        if gen is not None:
+                            rnd = torch.rand(remain.shape, generator=gen, device=remain.device, dtype=remain.dtype)
+                        else:
+                            rnd = torch.rand_like(remain)
+                        extra = (rnd < p_extra).to(dtype=remain.dtype)
+                        drop = torch.clamp(drop + extra, max=1.0)
+                keep = (1.0 - drop).to(dtype=m_struct_w.dtype)
+                m_sampled = m_struct_w * keep
         else:  # corr
             L, H = m_struct_w.shape
             if self._gen is not None:
@@ -182,8 +233,60 @@ class SelfSupervisedMaskingDataset(SlidingWindowDataset):
                 tau = torch.quantile(vals, q=1.0 - torch.as_tensor(p_keep, dtype=vals.dtype, device=vals.device))
                 keep = (u_s >= tau).to(dtype=m_struct_w.dtype)
             m_sampled = m_struct_w * keep
-        x_masked = torch.where(m_sampled > 0.5, xw, torch.zeros_like(xw))
-        return x_masked, m_sampled, xw
+        # Input construction: always add noise at selected masked locations (no zero-drop path)
+        # build drop mask over structurally observed cells that were sampled as missing
+        drop = ((m_struct_w > 0.5) & (m_sampled <= 0.5)).to(dtype=torch.float32)
+        x_in = self._maybe_apply_noise(xw, drop)
+        return x_in, m_sampled, xw
+
+    def _maybe_apply_noise(self, x: torch.Tensor, drop: torch.Tensor) -> torch.Tensor:
+        """Apply noise on positions where drop==1, keep original elsewhere.
+
+        Noise is generated using the local torch.Generator for reproducibility when available.
+        """
+        if drop.dtype != torch.float32:
+            drop = drop.to(dtype=torch.float32)
+        gen = self._gen
+        kind = self.noise_kind
+        x_noisy = x.clone()
+        if kind == 'gaussian':
+            if gen is not None:
+                noise = torch.randn(x_noisy.shape, generator=gen, device=x_noisy.device, dtype=x_noisy.dtype) * self.noise_sigma
+            else:
+                noise = torch.randn_like(x_noisy) * self.noise_sigma
+            x_noisy = x_noisy + noise * drop
+        elif kind == 'bias':
+            low, high = self.noise_bias_min, self.noise_bias_max
+            if gen is not None:
+                r = torch.rand(x_noisy.shape, generator=gen, device=x_noisy.device, dtype=x_noisy.dtype)
+            else:
+                r = torch.rand_like(x_noisy)
+            b = low + (high - low) * r
+            x_noisy = x_noisy + b * drop
+        elif kind == 'scale':
+            a, bmax = self.noise_scale_min, self.noise_scale_max
+            if gen is not None:
+                r = torch.rand(x_noisy.shape, generator=gen, device=x_noisy.device, dtype=x_noisy.dtype)
+            else:
+                r = torch.rand_like(x_noisy)
+            s = a + (bmax - a) * r
+            x_noisy = x_noisy * (1.0 + (s - 1.0) * drop)
+        elif kind == 'spike':
+            a, bmax = self.noise_amp_min, self.noise_amp_max
+            if gen is not None:
+                r1 = torch.rand(x_noisy.shape, generator=gen, device=x_noisy.device, dtype=x_noisy.dtype)
+                r2 = torch.rand(x_noisy.shape, generator=gen, device=x_noisy.device, dtype=x_noisy.dtype)
+            else:
+                r1 = torch.rand_like(x_noisy)
+                r2 = torch.rand_like(x_noisy)
+            amp = a + (bmax - a) * r1
+            sign = torch.where(r2 >= 0.5, 1.0, -1.0)
+            x_noisy = x_noisy + sign * amp * drop
+        else:
+            # unknown kind -> fallback to drop zeros
+            x_noisy = torch.where(drop > 0.5, torch.zeros_like(x_noisy), x_noisy)
+        # Ensure structurally missing cells remain zeroed
+        return torch.where(drop > 0.5, x_noisy, x)
 
 
 @dataclass
@@ -221,6 +324,15 @@ def create_normal_loaders(
     block_max_blocks: int = 4,
     corr_t: int = 7,
     corr_f: int = 15,
+    # input corruption (always enabled on selected masked positions)
+    noise_kind: str = 'gaussian',
+    noise_sigma: float = 1.0,
+    noise_bias_min: int | float = -1.0,
+    noise_bias_max: int | float = 1.0,
+    noise_scale_min: int | float = 0.5,
+    noise_scale_max: int | float = 1.5,
+    noise_amp_min: int | float = 3.0,
+    noise_amp_max: int | float = 6.0,
     seed: Optional[int] = 1337,
     num_workers: int = 0,
 ) -> DataModule:
@@ -247,6 +359,11 @@ def create_normal_loaders(
         block_f_min=block_f_min, block_f_max=block_f_max,
         block_max_blocks=block_max_blocks,
         corr_t=corr_t, corr_f=corr_f,
+        noise_kind=noise_kind,
+        noise_sigma=float(noise_sigma),
+        noise_bias_min=float(noise_bias_min), noise_bias_max=float(noise_bias_max),
+        noise_scale_min=float(noise_scale_min), noise_scale_max=float(noise_scale_max),
+        noise_amp_min=float(noise_amp_min), noise_amp_max=float(noise_amp_max),
     )
     ds_val = SelfSupervisedMaskingDataset(
         Xva, M_val.astype(np.float32), time_length, stride,
@@ -256,6 +373,11 @@ def create_normal_loaders(
         block_f_min=block_f_min, block_f_max=block_f_max,
         block_max_blocks=block_max_blocks,
         corr_t=corr_t, corr_f=corr_f,
+        noise_kind=noise_kind,
+        noise_sigma=float(noise_sigma),
+        noise_bias_min=float(noise_bias_min), noise_bias_max=float(noise_bias_max),
+        noise_scale_min=float(noise_scale_min), noise_scale_max=float(noise_scale_max),
+        noise_amp_min=float(noise_amp_min), noise_amp_max=float(noise_amp_max),
     )
     ds_test = SelfSupervisedMaskingDataset(
         Xte, M_test.astype(np.float32), time_length, stride,
@@ -265,6 +387,11 @@ def create_normal_loaders(
         block_f_min=block_f_min, block_f_max=block_f_max,
         block_max_blocks=block_max_blocks,
         corr_t=corr_t, corr_f=corr_f,
+        noise_kind=noise_kind,
+        noise_sigma=float(noise_sigma),
+        noise_bias_min=float(noise_bias_min), noise_bias_max=float(noise_bias_max),
+        noise_scale_min=float(noise_scale_min), noise_scale_max=float(noise_scale_max),
+        noise_amp_min=float(noise_amp_min), noise_amp_max=float(noise_amp_max),
     )
     wif_train = _make_worker_init_fn(seed)
     wif_val = _make_worker_init_fn(None if seed is None else seed + 1)

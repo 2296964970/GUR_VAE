@@ -14,11 +14,11 @@ def test_model_elbo_and_shapes():
     assert out['mu'].shape == (B, Z, T)
 
 
-def test_model_impute_online_passes_observed():
+def test_model_reconstruct_online_passes_observed():
     B, T, H, Z = 1, 4, 3, 2
     model = OnlineGPVAE(input_dim=H, output_dim=H, latent_dim=Z, enc_hidden_size=8)
     x = torch.randn(B, T, H)
     m = torch.zeros(B, T, H)
     m[:, :, 0] = 1.0
-    y = model.impute_online(x, m, use_mean=True)
+    y = model.reconstruct_online(x, m, use_mean=True)
     assert torch.allclose(y[:, :, 0], x[:, :, 0])
