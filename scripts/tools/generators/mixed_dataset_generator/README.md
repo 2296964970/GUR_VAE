@@ -43,9 +43,9 @@ python generate_mixed_dataset.py \
 from generate_mixed_dataset import generate_mixed_dataset
 
 mixed_data, mixed_labels = generate_mixed_dataset(
-    normal_data_path="data/normal.csv",
-    attack_data_path="data/attack.csv",
-    attack_labels_path="data/labels.csv",
+    normal_data_path="input/normal.csv",
+    attack_data_path="input/attack.csv",
+    attack_labels_path="input/labels.csv",
     output_dir="output/mixed",
     attack_ratio=0.3,
     random_seed=42

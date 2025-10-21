@@ -61,16 +61,16 @@ Tools for generating synthetic datasets.
 
 ```bash
 python validation/check_alignment.py \
-    --attacked data/case1/case1_fdia_noisy.csv \
-    --labels data/case1/case1_fdia_labels.csv
+    --attacked input/case1/case1_fdia_noisy.csv \
+    --labels input/case1/case1_fdia_labels.csv
 ```
 
 ### Sort and Normalize Timestamps
 
 ```bash
 python processing/sort_and_normalize_csv.py \
-    --in_path data/raw.csv \
-    --out_path data/normalized.csv \
+    --in_path input/raw.csv \
+    --out_path input/normalized.csv \
     --dedup
 ```
 
@@ -78,7 +78,7 @@ python processing/sort_and_normalize_csv.py \
 
 ```bash
 python reporting/case_report.py \
-    --data_dir data \
+    --data_dir input \
     --case case118
 ```
 
@@ -86,9 +86,9 @@ python reporting/case_report.py \
 
 ```bash
 python processing/clean_attacked_labels_pair.py \
-    --attacked data/attacked.csv \
-    --labels data/labels.csv \
-    --out_dir data/cleaned \
+    --attacked input/attacked.csv \
+    --labels input/labels.csv \
+    --out_dir input/cleaned \
     --case case1
 ```
 
@@ -107,6 +107,7 @@ python processing/clean_attacked_labels_pair.py \
 ## File Naming Conventions
 
 Expected file naming patterns:
-- Normal data: `{case}_acopf_all_rows_noisy.csv`
-- Attacked data: `{case}_fdia_2025-07_2025-08_noisy.csv`
-- Labels: `{case}_fdia_2025-07_2025-08_labels.csv`
+- Training data (2025/07-08): `{case}_acopf_2025-07_2025-08_noisy.csv`
+- Inference data (2025/09):
+  - Normal: `{case}_acopf_2025-09_noisy.csv`
+  - Attacked: `{case}_fdia_2025-09_noisy.csv`

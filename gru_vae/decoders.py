@@ -5,7 +5,11 @@ import torch.nn as nn
 
 
 class GaussianDecoder(nn.Module):
-    """MLP decoder mapping z[B,Z,T] -> x params [B,T,H]."""
+    """MLP decoder mapping z[B,Z,T] -> x params [B,T,H].
+
+    This simplified version always uses learnable per-feature log-variance
+    (time-invariant), removing the fixed-variance branch.
+    """
 
     def __init__(
         self,
@@ -13,7 +17,6 @@ class GaussianDecoder(nn.Module):
         z_size: int,
         hidden_sizes: Sequence[int] = (256, 256),
         *,
-        learn_var: bool = False,
         init_logvar: float = -2.0,
         output_activation: Optional[nn.Module] = None,
     ) -> None:
@@ -25,7 +28,6 @@ class GaussianDecoder(nn.Module):
         self.output_dim = int(output_dim)
         self.z_size = int(z_size)
         self.hidden_sizes = tuple(int(h) for h in hidden_sizes)
-        self.learn_var = bool(learn_var)
         self.output_activation = output_activation
 
         layers = []
@@ -37,10 +39,8 @@ class GaussianDecoder(nn.Module):
         layers.append(nn.Linear(in_f, self.output_dim))
         self.net = nn.Sequential(*layers)
 
-        if self.learn_var:
-            self.logvar_param = nn.Parameter(torch.full((self.output_dim,), float(init_logvar)))
-        else:
-            self.register_buffer('fixed_logvar', torch.tensor(float(init_logvar)))
+        # Learnable per-feature log-variance (broadcast over [B,T])
+        self.logvar_param = nn.Parameter(torch.full((self.output_dim,), float(init_logvar)))
 
     def forward(self, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         if z.ndim != 3:
@@ -53,10 +53,7 @@ class GaussianDecoder(nn.Module):
         if self.output_activation is not None:
             y = self.output_activation(y)
         mean = y.view(B, T, self.output_dim)
-        if self.learn_var:
-            logvar = self.logvar_param.view(1, 1, self.output_dim).expand_as(mean)
-        else:
-            logvar = self.fixed_logvar.expand_as(mean)
+        logvar = self.logvar_param.view(1, 1, self.output_dim).expand_as(mean)
         return mean, logvar
 
 

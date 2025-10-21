@@ -26,9 +26,15 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 
-from gru_vae.data import load_timeseries, SlidingWindowDataset, masked_mean_std
+from gru_vae.data import load_timeseries, SlidingWindowDataset, masked_mean_std, resolve_training_csv
 from gru_vae.model import OnlineGPVAE
+from gru_vae.noise import apply_noise
 from gru_vae.utils import parse_sizes, resolve_device
+
+def _ensure_outdir_case(case: str, kind: str) -> str:
+    base = os.path.join('output', case, kind)
+    os.makedirs(base, exist_ok=True)
+    return base
 def _check_headers_match(a_csv: str, b_csv: str) -> List[str]:
     df_a = pd.read_csv(a_csv, nrows=1)
     df_b = pd.read_csv(b_csv, nrows=1)
@@ -62,7 +68,7 @@ def _compute_tail_scores_window(
     m_w: np.ndarray,
     *,
     device: torch.device,
-) -> np.ndarray:
+) -> Tuple[np.ndarray, np.ndarray]:
     L, H = x_w.shape
     xb = torch.from_numpy(x_w[None, :, :]).to(device).float()
     mb = torch.from_numpy(m_w[None, :, :]).to(device).float()
@@ -89,7 +95,8 @@ def _compute_tail_scores_window(
         out = np.full((H,), np.nan, dtype=np.float64)
         obs_idx = m_np > 0.5
         out[obs_idx] = nll_np[obs_idx]
-        return out
+        logv_tail = logv_last.squeeze(0).cpu().numpy().astype(np.float64)
+        return out, logv_tail
 
 
 def _calibrate_thresholds_normal(
@@ -204,7 +211,7 @@ def _reconstruct_tail(
         return acc / float(S)
 
 
-def _select_tail_timestamp_only(*, attack_timestamp: str, timestamps: pd.Series, L: int) -> int:
+def _select_tail_timestamp_only(*, attack_timestamp: str, timestamps: pd.Series, L: int, quiet: bool = False) -> int:
     if not attack_timestamp:
         raise SystemExit('[error] --attack_timestamp is required')
     min_t = max(0, int(L) - 1)
@@ -221,40 +228,42 @@ def _select_tail_timestamp_only(*, attack_timestamp: str, timestamps: pd.Series,
         if idx >= min_t:
             return int(idx)
     if matches.size > 0:
-        print('[warn] Provided attack_timestamp exists but violates window length; searching forward')
+        if not quiet:
+            print('[warn] Provided attack_timestamp exists but violates window length; searching forward')
     else:
-        print('[warn] Provided attack_timestamp not found; searching forward by time')
+        if not quiet:
+            print('[warn] Provided attack_timestamp not found; searching forward by time')
     # First feasible at/after target_dt
     feasible = np.where(ts_parsed >= target_dt)[0]
     feasible = feasible[feasible >= min_t]
     if feasible.size == 0:
         raise SystemExit('[error] No feasible rows at/after the provided time for the requested window length')
     fallback = int(feasible[0])
-    print(f'[warn] Fallback tail selected at index {fallback} (min_t={min_t})')
+    if not quiet:
+        print(f'[warn] Fallback tail selected at index {fallback} (min_t={min_t})')
     return fallback
 
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument('--data_dir', type=str, default='data')
+    p.add_argument('--data_dir', type=str, default='input')
     p.add_argument('--case', type=str, default='case14')
     p.add_argument('--normal_csv', type=str, default='')
     p.add_argument('--attacked_csv', type=str, default='')
-    p.add_argument('--time_length', type=int, default=24)
-    p.add_argument('--sliding_steps', type=int, default=6, help='Number of consecutive tail steps to repair (>=1)')
+    p.add_argument('--time_length', type=int, default=96)
+    p.add_argument('--sliding_steps', type=int, default=12, help='Number of consecutive tail steps to repair (>=1)')
     # Timestamp-only selection
     p.add_argument('--attack_timestamp', type=str, required=True, help='Exact time; if invalid, fallback to first feasible attacked tail at/after this time')
     # Thresholds
-    p.add_argument('--alpha', type=float, default=0.01)
+    p.add_argument('--alpha', type=float, default=0.02)
     p.add_argument('--min_count_per_feature', type=int, default=100)
+    # Threshold mode: keep only global per-feature quantile thresholds
     # Diagnostics
     p.add_argument('--print_topk', dest='print_topk', action='store_true', help='Print top-K tail scores per step')
     p.add_argument('--no-print_topk', dest='print_topk', action='store_false')
     p.set_defaults(print_topk=False)
     p.add_argument('--topk', type=int, default=20, help='Top-K features by tail score to display when --print_topk is set')
-    p.add_argument('--dump_thresholds', type=str, default='', help='Path to save per-feature thresholds CSV')
-    p.add_argument('--dump_tail_scores_dir', type=str, default='', help='Directory to save per-step tail score CSVs')
-    # Tail-scores wide-format options
+    # Tail-scores wide-format options (output path is fixed under output/<case>/tail_scores)
     p.add_argument('--tail_scores_wide', dest='tail_scores_wide', action='store_true',
                    help='Also emit a wide CSV where each row is a timestamp and each column is a feature')
     p.add_argument('--no-tail_scores_wide', dest='tail_scores_wide', action='store_false')
@@ -265,6 +274,10 @@ def main() -> None:
     p.add_argument('--print_drop_metrics', dest='print_drop_metrics', action='store_true', help='Print drop-only metrics in summary')
     p.add_argument('--no-print_drop_metrics', dest='print_drop_metrics', action='store_false')
     p.set_defaults(print_drop_metrics=True)
+    # Verbose control
+    p.add_argument('--verbose', dest='quiet', action='store_false', help='Verbose mode: show detailed progress')
+    p.add_argument('--no-verbose', dest='quiet', action='store_true')
+    p.set_defaults(quiet=True)
     # Output naming
     p.add_argument('--out_suffix', type=str, default='', help='Optional suffix to append to output CSV filenames')
     # Model
@@ -277,10 +290,17 @@ def main() -> None:
     p.add_argument('--no-obs_learn_var', dest='obs_learn_var', action='store_false')
     p.set_defaults(obs_learn_var=True)
     p.add_argument('--obs_init_logvar', type=float, default=-3.5)
-    p.add_argument('--ckpt', type=str, default='models/gru_smoke/ckpt.pt')
+    p.add_argument('--ckpt', type=str, default='')
     p.add_argument('--batch_size', type=int, default=64)
+    # Inference-time noise (align with training corruption on masked positions)
+    # Inference-time noise uses decoder-variance-adaptive sigma at tail (no fixed mode kept)
+    p.add_argument('--noise_seed', type=int, default=-1, help='If >=0, use deterministic noise with seed+tail_idx')
     p.add_argument('--train_ratio', type=float, default=0.7)
     p.add_argument('--device', type=str, default='cpu', choices=['cpu', 'cuda'])
+    # Stats source: use training normal set (recommended) to match training standardization, or fallback to current normal
+    p.add_argument('--stats_source', type=str, default='training', choices=['training', 'normal'],
+                   help='Use mean/std from auto-detected training normal set (clean 2025/07-08) or from the provided normal_csv')
+    
     args = p.parse_args()
 
     if args.time_length <= 0:
@@ -292,27 +312,53 @@ def main() -> None:
 
     # Resolve CSVs
     case_dir = os.path.join(args.data_dir, args.case)
-    normal_csv = args.normal_csv or os.path.join(case_dir, f"{args.case}_acopf_all_rows_noisy.csv")
-    if not os.path.exists(normal_csv):
-        raise SystemExit(f'[error] Normal CSV not found: {normal_csv}')
+    # Normal: prefer 2025-09 clean (non-fdia), search in case dir and 'infer/'
+    normal_csv = args.normal_csv
+    if not normal_csv:
+        normal_guess = ''
+        search_dirs = [case_dir, os.path.join(case_dir, 'infer')]
+        for d in search_dirs:
+            if not os.path.isdir(d):
+                continue
+            for fname in sorted(os.listdir(d)):
+                low = fname.lower()
+                if (low.endswith('.csv')) and ('2025-09' in low) and ('fdia' not in low):
+                    # prefer acopf_2025-09_noisy over other variants
+                    path = os.path.join(d, fname)
+                    if 'acopf_2025-09_noisy' in low:
+                        normal_guess = path
+                        break
+                    if not normal_guess:
+                        normal_guess = path
+            if normal_guess:
+                break
+        normal_csv = normal_guess
+    if not normal_csv or not os.path.exists(normal_csv):
+        raise SystemExit('[error] Could not infer normal_csv (clean 2025/09). Provide --normal_csv explicitly.')
+
     attacked_csv = args.attacked_csv
     if not attacked_csv:
         attacked_guess = ''
-        if os.path.isdir(case_dir):
-            for fname in sorted(os.listdir(case_dir)):
+        search_dirs = [case_dir, os.path.join(case_dir, 'infer')]
+        for d in search_dirs:
+            if not os.path.isdir(d):
+                continue
+            for fname in sorted(os.listdir(d)):
                 lower = fname.lower()
-                if lower.endswith('.csv') and 'fdia' in lower and 'noisy' in lower:
-                    attacked_guess = os.path.join(case_dir, fname)
+                if lower.endswith('.csv') and 'fdia' in lower and '2025-09' in lower:
+                    attacked_guess = os.path.join(d, fname)
                     break
+            if attacked_guess:
+                break
         attacked_csv = attacked_guess
     if not attacked_csv:
-        raise SystemExit('[error] Could not infer attacked_csv; provide it explicitly')
+        raise SystemExit('[error] Could not infer attacked_csv (fdia 2025/09); provide it explicitly')
 
     headers = _check_headers_match(normal_csv, attacked_csv)
     feat_names = headers[1:]
     ts_col = headers[0]
 
-    # Load sequences
+    # Load sequences (full normal/attacked for the target month)
     Xn, Mn_struct, ts = load_timeseries(normal_csv)
     Xa, Ma_struct, ts_a = load_timeseries(attacked_csv)
     if len(ts) != Xn.shape[0] or len(ts_a) != Xa.shape[0]:
@@ -320,14 +366,28 @@ def main() -> None:
     if not np.all(ts.astype(str).values == ts_a.astype(str).values):
         raise SystemExit('[error] Timestamps are not perfectly aligned between Normal and Attacked CSVs')
 
-    # Standardize
-    Xn_std, Xa_std, mean, std_safe, Mn_struct_f, Ma_struct_f = _standardize_full(
-        Xn, Mn_struct, Xa, Ma_struct, train_ratio=args.train_ratio
-    )
+    # Standardize with consistent mean/std
+    # If stats_source == 'training', compute mean/std from auto-detected clean 2025/07-08 training set
+    # to match training-time standardization; otherwise compute from the current normal month.
+    if args.stats_source == 'training':
+        train_csv = resolve_training_csv(args.data_dir, args.case)
+        Xtr_full, Mtr_full, _ = load_timeseries(train_csv)
+        Ttr = Xtr_full.shape[0]
+        train_T = int(Ttr * float(args.train_ratio))
+        mean, std = masked_mean_std(Xtr_full[:train_T], Mtr_full[:train_T])
+        std_safe = np.where(std > 0, std, 1.0).astype(np.float32)
+        Xn_std = np.where(Mn_struct > 0.5, (Xn - mean) / std_safe, 0.0).astype(np.float32)
+        Xa_std = np.where(Ma_struct > 0.5, (Xa - mean) / std_safe, 0.0).astype(np.float32)
+        Mn_struct_f = Mn_struct.astype(np.float32)
+        Ma_struct_f = Ma_struct.astype(np.float32)
+    else:
+        Xn_std, Xa_std, mean, std_safe, Mn_struct_f, Ma_struct_f = _standardize_full(
+            Xn, Mn_struct, Xa, Ma_struct, train_ratio=args.train_ratio
+        )
 
     # Select tail by timestamp-only with fallback to first feasible
     L = int(args.time_length)
-    t = _select_tail_timestamp_only(attack_timestamp=args.attack_timestamp, timestamps=ts, L=L)
+    t = _select_tail_timestamp_only(attack_timestamp=args.attack_timestamp, timestamps=ts, L=L, quiet=args.quiet)
     s = t - (L - 1)
     e = t + 1
     if s < 0:
@@ -360,25 +420,31 @@ def main() -> None:
             model.load_state_dict(state['state_dict'])
         else:
             model.load_state_dict(state)
-        print(f'[ok] Loaded checkpoint: {args.ckpt}')
+        if not args.quiet:
+            print(f'[ok] Loaded checkpoint: {args.ckpt}')
     else:
-        if args.ckpt:
+        if args.ckpt and not args.quiet:
             print(f'[warn] Checkpoint not found: {args.ckpt}. Continue with random weights.')
 
-    # Calibrate thresholds on Normal
+    # Calibrate thresholds on Normal (global per-feature)
     thresholds_meta = _calibrate_thresholds_normal(
-        model, Xn_std, Mn_struct_f, L, batch_size=args.batch_size, device=device,
-        alpha=args.alpha, min_count_per_feature=args.min_count_per_feature, feature_names=feat_names,
+        model, Xn_std, Mn_struct_f, L,
+        batch_size=args.batch_size, device=device,
+        alpha=args.alpha, min_count_per_feature=args.min_count_per_feature,
+        feature_names=feat_names,
     )
-    # Optionally dump thresholds to CSV
-    if args.dump_thresholds:
-        thr_map: Dict[str, float] = thresholds_meta['thresholds']  # type: ignore[index]
-        df_thr = pd.DataFrame({
-            'feature': feat_names,
-            'threshold': [float(thr_map[name]) for name in feat_names],
-        })
-        df_thr.to_csv(args.dump_thresholds, index=False, encoding='utf-8')
-        print(f"[ok] Saved thresholds CSV: {args.dump_thresholds} (features={len(df_thr)})")
+    # Always dump thresholds to output/<case>/thresholds
+    thr_map: Dict[str, float] = thresholds_meta['thresholds']  # type: ignore[index]
+    df_thr = pd.DataFrame({
+        'feature': feat_names,
+        'threshold': [float(thr_map[name]) for name in feat_names],
+    })
+    thr_outdir = _ensure_outdir_case(args.case, 'thresholds')
+    thr_name = f"thresholds_L{L}_alpha{str(args.alpha).replace('.', '_')}.csv"
+    thr_path = os.path.join(thr_outdir, thr_name)
+    df_thr.to_csv(thr_path, index=False, encoding='utf-8')
+    if not args.quiet:
+        print(f"[ok] Saved thresholds CSV: {thr_path} (features={len(df_thr)})")
 
     sliding_steps = int(args.sliding_steps)
     max_tail_idx = t + sliding_steps - 1
@@ -393,8 +459,11 @@ def main() -> None:
     def rel_improve(a: float, b: float) -> float:
         return 100.0 * (b - a) / max(b, 1e-12)
 
-    print(f"[info] Sliding repair starts at tail index {t} ({ts.iloc[t]}) with L={L} for {sliding_steps} steps")
-    print('[info] Mode: history reuses all previously repaired tails (others from Normal)')
+    if not args.quiet:
+        print(f"[info] Sliding repair starts at tail index {t} ({ts.iloc[t]}) with L={L} for {sliding_steps} steps")
+        print('[info] Mode: history reuses all previously repaired tails (others from Normal)')
+
+    
 
     for step_offset in range(sliding_steps):
         tail_idx = t + step_offset
@@ -418,7 +487,7 @@ def main() -> None:
         M_T_struct[-1] = Ma_struct_f[tail_idx].astype(np.float32)
         X_T_std = np.where(M_T_struct > 0.5, (X_T_raw - mean) / std_safe, 0.0).astype(np.float32)
 
-        scores_tail = _compute_tail_scores_window(model, X_T_std, M_T_struct, device=device)
+        scores_tail, logv_tail = _compute_tail_scores_window(model, X_T_std, M_T_struct, device=device)
         m_tail = M_T_struct[-1]
         pred_tail = _apply_thresholds(scores_tail, m_tail, thresholds_meta, feat_names)
         m_imp = M_T_struct.copy()
@@ -444,8 +513,7 @@ def main() -> None:
                     tau = float(thr_map[name])
                     keep_pred = int(sc <= tau)
                     print(f"  #{rank+1:02d} {name:>20s}  score={sc:.6f}  thr={tau:.6f}  keep_pred={keep_pred}")
-        if args.dump_tail_scores_dir:
-            os.makedirs(args.dump_tail_scores_dir, exist_ok=True)
+        if args.tail_scores_wide:
             thr_map: Dict[str, float] = thresholds_meta['thresholds']  # type: ignore[index]
             # Always emit wide-format CSV only: one row per timestamp, columns match input features
             kind = str(args.tail_scores_value) if hasattr(args, 'tail_scores_value') else 'score'
@@ -459,14 +527,38 @@ def main() -> None:
                 vals = is_anom.astype(np.float64)
             header = [ts_col] + list(feat_names)
             row_vals = [timestamp_str] + [float(x) for x in vals.tolist()]
-            out_wide = os.path.join(args.dump_tail_scores_dir, f"tail_scores_wide_{kind}.csv")
+            wide_outdir = _ensure_outdir_case(args.case, 'tail_scores')
+            out_wide = os.path.join(wide_outdir, f"tail_scores_wide_{kind}.csv")
             need_header = not os.path.exists(out_wide)
             with open(out_wide, 'a', encoding='utf-8') as fw:
                 if need_header:
                     fw.write(','.join(header) + '\n')
                 fw.write(','.join(str(v) for v in row_vals) + '\n')
-            print(f"[ok] Appended wide tail scores ({kind}) to: {out_wide}")
-        x_in = np.where(m_imp > 0.5, X_T_std, 0.0).astype(np.float32)
+            if not args.quiet:
+                print(f"[ok] Appended wide tail scores ({kind}) to: {out_wide}")
+        # Build encoder input by injecting Gaussian noise only on predicted anomalous tail positions (mask=0).
+        # This matches training semantics of corrupted masked inputs; no zero-filling here.
+        mask_keep_noise = np.ones_like(M_T_struct, dtype=np.float32)
+        mask_keep_noise[-1, is_anom] = 0.0
+        
+        rng = None
+        if int(getattr(args, 'noise_seed', -1)) >= 0:
+            try:
+                rng = np.random.default_rng(int(args.noise_seed) + int(tail_idx))
+            except Exception:
+                rng = None
+        # Determine sigma for anomalies from decoder log-variance (adaptive-only)
+        sigma_tail = np.exp(0.5 * logv_tail).astype(np.float64)
+        sigma_arr = np.zeros_like(X_T_std, dtype=np.float64)
+        sigma_arr[-1, :] = sigma_tail
+        sigma_for_apply: float | np.ndarray = sigma_arr
+        x_in = apply_noise(
+            X_T_std.astype(np.float32),
+            mask_keep_noise.astype(np.float32),
+            kind='gaussian',
+            rng=rng,
+            sigma=sigma_for_apply,
+        )
         y_std = _reconstruct_tail(model, x_in, m_imp, device=device)
         y = y_std * std_safe + mean
         current_stream[tail_idx] = y[-1].astype(np.float32)
@@ -474,12 +566,9 @@ def main() -> None:
         repaired_mask[tail_idx] = True
 
         # Also append repaired values (wide format): one row per timestamp, columns match input features
-        if args.dump_tail_scores_dir:
-            try:
-                os.makedirs(args.dump_tail_scores_dir, exist_ok=True)
-            except Exception:
-                pass
-            out_repaired = os.path.join(args.dump_tail_scores_dir, 'tail_repaired_wide.csv')
+        if args.tail_scores_wide:
+            rep_wide_dir = _ensure_outdir_case(args.case, 'repaired')
+            out_repaired = os.path.join(rep_wide_dir, 'tail_repaired_wide.csv')
             header_rep = [ts_col] + list(feat_names)
             need_header_rep = not os.path.exists(out_repaired)
             y_tail_vec = y[-1].astype(np.float64)
@@ -492,14 +581,11 @@ def main() -> None:
         x_true_tail = Xn[tail_idx].astype(np.float64)
         x_att_tail = Xa[tail_idx].astype(np.float64)
         # Also append attacked/true values as wide CSVs for side-by-side comparison
-        if args.dump_tail_scores_dir:
-            try:
-                os.makedirs(args.dump_tail_scores_dir, exist_ok=True)
-            except Exception:
-                pass
+        if args.tail_scores_wide:
+            rep_wide_dir = _ensure_outdir_case(args.case, 'repaired')
             header_w = [ts_col] + list(feat_names)
             # attacked
-            out_att = os.path.join(args.dump_tail_scores_dir, 'tail_attacked_wide.csv')
+            out_att = os.path.join(rep_wide_dir, 'tail_attacked_wide.csv')
             if not os.path.exists(out_att):
                 with open(out_att, 'w', encoding='utf-8') as fw:
                     fw.write(','.join(header_w) + '\n')
@@ -507,7 +593,7 @@ def main() -> None:
             with open(out_att, 'a', encoding='utf-8') as fw:
                 fw.write(','.join(str(v) for v in row_att) + '\n')
             # true (clean baseline)
-            out_true = os.path.join(args.dump_tail_scores_dir, 'tail_true_wide.csv')
+            out_true = os.path.join(rep_wide_dir, 'tail_true_wide.csv')
             if not os.path.exists(out_true):
                 with open(out_true, 'w', encoding='utf-8') as fw:
                     fw.write(','.join(header_w) + '\n')
@@ -533,6 +619,8 @@ def main() -> None:
         nmae_b = float(np.mean(np.abs(nerr_att)))
         nrmse = float(np.sqrt(np.mean(nerr_rep ** 2)))
         nmae = float(np.mean(np.abs(nerr_rep)))
+
+        
 
         obs_count = int(np.sum(m_tail_obs))
         drop_count = int(np.sum(is_anom))
@@ -580,28 +668,29 @@ def main() -> None:
             'nrmse_drop': nrmse_drop,
         })
 
-        print(
-            "[info] Step "
-            f"{step_offset}: window s={s_step}, e={e_step} (tail index {tail_idx}, timestamp {timestamp_str}), "
-            f"observed_tail_count={obs_count}, dropped={drop_count} ({drop_rate:.2f}%)"
-        )
+        if not args.quiet:
+            print(
+                "[info] Step "
+                f"{step_offset}: window s={s_step}, e={e_step} (tail index {tail_idx}, timestamp {timestamp_str}), "
+                f"observed_tail_count={obs_count}, dropped={drop_count} ({drop_rate:.2f}%)"
+            )
 
     # Always save only repaired tail rows (one row per sliding step)
     base = os.path.splitext(os.path.basename(attacked_csv))[0]
     suffix = ("_" + args.out_suffix.strip()) if args.out_suffix and args.out_suffix.strip() else ""
-    out_tail_csv = os.path.join(
-        os.path.dirname(attacked_csv),
-        f"{base}_repaired_tail_rows_L{L}_steps{sliding_steps}{suffix}.csv",
-    )
+    rep_outdir = _ensure_outdir_case(args.case, 'repaired')
+    out_tail_csv = os.path.join(rep_outdir, f"{base}_repaired_tail_rows_L{L}_steps{sliding_steps}{suffix}.csv")
     if repaired_tail_rows:
         stamps = [it[1] for it in repaired_tail_rows]
         vals = np.stack([it[2] for it in repaired_tail_rows], axis=0)
         df_tail = pd.DataFrame(vals, columns=feat_names)
         df_tail.insert(0, ts_col, stamps)
         df_tail.to_csv(out_tail_csv, index=False, encoding='utf-8')
-        print(f"[ok] Saved repaired tail rows CSV: {out_tail_csv} (rows={len(stamps)})")
+        if not args.quiet:
+            print(f"[ok] Saved repaired tail rows CSV: {out_tail_csv} (rows={len(stamps)})")
     else:
-        print('[warn] No repaired tail rows to save (empty sliding result).')
+        if not args.quiet:
+            print('[warn] No repaired tail rows to save (empty sliding result).')
 
     print('\nSummary (lower is better):')
     header = (

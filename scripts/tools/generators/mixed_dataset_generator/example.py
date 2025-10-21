@@ -8,7 +8,7 @@ from pathlib import Path
 
 # 定义数据路径
 # 请根据你的实际情况修改这些路径
-data_dir = Path(__file__).parent.parent.parent / "data" / "case118"
+data_dir = Path(__file__).parent.parent.parent / "input" / "case118"
 
 normal_data_path = data_dir / "case118_acopf_all_rows_noisy.csv"
 attack_data_path = data_dir / "case118_fdia_2025-07_2025-08_noisy.csv"

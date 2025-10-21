@@ -129,7 +129,7 @@ def apply_noise(
     *,
     kind: str = "gaussian",
     rng: Optional[np.random.Generator] = None,
-    sigma: float = 1.0,
+    sigma: float | np.ndarray = 1.0,
     bias_min: float = -1.0,
     bias_max: float = 1.0,
     scale_min: float = 0.5,
@@ -153,7 +153,23 @@ def apply_noise(
     x = x.astype(np.float32, copy=True)
     keep = (mask_keep.astype(np.float32) > 0.5)
     if kind == "gaussian":
-        noise = rng.normal(loc=0.0, scale=float(sigma), size=x.shape).astype(np.float32)
+        # Support scalar or per-element sigma. When sigma is array-like, broadcast
+        # or expand to x.shape so that each cell can have its own noise scale.
+        if isinstance(sigma, np.ndarray):
+            # Broadcast to x.shape via zeros template
+            if sigma.shape != x.shape:
+                # Try broadcast to [T,H]
+                try:
+                    sigma_b = np.zeros_like(x, dtype=np.float32)
+                    sigma_b[...] = sigma  # numpy broadcasting
+                    sigma_arr = sigma_b.astype(np.float32)
+                except Exception:
+                    raise ValueError("sigma array is not broadcastable to input shape")
+            else:
+                sigma_arr = sigma.astype(np.float32)
+        else:
+            sigma_arr = np.full_like(x, float(sigma), dtype=np.float32)
+        noise = rng.normal(loc=0.0, scale=sigma_arr, size=None).astype(np.float32)
         x[~keep] = x[~keep] + noise[~keep]
     elif kind == "bias":
         b = rng.uniform(low=float(bias_min), high=float(bias_max), size=x.shape).astype(np.float32)
@@ -177,4 +193,3 @@ __all__ = [
     "sample_window_mask",
     "apply_noise",
 ]
-

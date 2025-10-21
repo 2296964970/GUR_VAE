@@ -28,6 +28,7 @@ def _run_epoch(
     grad_clip: float,
     beta: Optional[float],
     train: bool,
+    adaptive_noise: bool = True,
 ) -> EpochStats:
     elbo_fn = model.elbo_sequence
     if train and optimizer is None:
@@ -53,11 +54,22 @@ def _run_epoch(
         if train:
             assert optimizer is not None
             optimizer.zero_grad(set_to_none=True)
-            # Prefer supervised loss on masked (missing) positions when x_true is provided and there are misses.
-            if (len(batch) == 3) and torch.any(m <= 0.5):
-                out = model.elbo_sequence_supervised(x_masked, m, x_true, supervise='miss', beta=beta)
+            # Adaptive noise: construct x_input by injecting Gaussian noise with sigma from decoder logvar
+            if adaptive_noise and torch.any(m <= 0.5):
+                with torch.no_grad():
+                    pred = model.elbo_sequence(x_true, m, beta=beta)
+                    logvar_x = pred['logvar_x']  # [B,T,H]
+                    sigma = torch.exp(0.5 * logvar_x)
+                eps = torch.randn_like(x_true)
+                miss = (m <= 0.5).to(dtype=x_true.dtype)
+                x_input = x_true + eps * sigma * miss
+                out = model.elbo_sequence_supervised(x_input, m, x_true, supervise='miss', beta=beta)
             else:
-                out = elbo_fn(x_masked, m, beta=beta)
+                # Prefer supervised loss on masked (missing) positions when x_true is provided and there are misses.
+                if (len(batch) == 3) and torch.any(m <= 0.5):
+                    out = model.elbo_sequence_supervised(x_masked, m, x_true, supervise='miss', beta=beta)
+                else:
+                    out = elbo_fn(x_masked, m, beta=beta)
             loss = out['loss']
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -71,10 +83,20 @@ def _run_epoch(
                 total_mse_obs += metrics['mse_obs'].mean().to(dtype=total_loss.dtype)
                 num_batches += 1
         else:
-            if (len(batch) == 3) and torch.any(m <= 0.5):
-                out = model.elbo_sequence_supervised(x_masked, m, x_true, supervise='miss', beta=beta)
+            if adaptive_noise and torch.any(m <= 0.5):
+                with torch.no_grad():
+                    pred = model.elbo_sequence(x_true, m, beta=beta)
+                    logvar_x = pred['logvar_x']
+                    sigma = torch.exp(0.5 * logvar_x)
+                    eps = torch.randn_like(x_true)
+                    miss = (m <= 0.5).to(dtype=x_true.dtype)
+                    x_input = x_true + eps * sigma * miss
+                out = model.elbo_sequence_supervised(x_input, m, x_true, supervise='miss', beta=beta)
             else:
-                out = elbo_fn(x_masked, m, beta=beta)
+                if (len(batch) == 3) and torch.any(m <= 0.5):
+                    out = model.elbo_sequence_supervised(x_masked, m, x_true, supervise='miss', beta=beta)
+                else:
+                    out = elbo_fn(x_masked, m, beta=beta)
             metrics = batch_metrics(out['mean'], out['logvar_x'], x_true, m)
             total_loss += out['loss'].detach().to(dtype=total_loss.dtype)
             total_nll += out['nll'].detach().to(dtype=total_loss.dtype)
@@ -101,12 +123,14 @@ class OnlineTrainer:
         device: Optional[torch.device] = None,
         grad_clip: float = 1e4,
         beta: Optional[float] = None,
+        adaptive_noise: bool = True,
     ) -> None:
         self.model = model
         self.optimizer = optimizer
         self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.grad_clip = float(grad_clip)
         self.beta = beta
+        self.adaptive_noise = bool(adaptive_noise)
         self.model.to(self.device)
 
     def _to_device(self, *tensors: torch.Tensor):
@@ -122,6 +146,7 @@ class OnlineTrainer:
             grad_clip=self.grad_clip,
             beta=self.beta,
             train=True,
+            adaptive_noise=self.adaptive_noise,
         )
 
     @torch.no_grad()
@@ -135,6 +160,7 @@ class OnlineTrainer:
             grad_clip=self.grad_clip,
             beta=self.beta,
             train=False,
+            adaptive_noise=self.adaptive_noise,
         )
 
     # No legacy bulk-imputation APIs are provided.

@@ -21,8 +21,9 @@ def set_seed(seed: int) -> None:
 def main() -> None:
     p = argparse.ArgumentParser()
     # Data
-    p.add_argument('--data_dir', type=str, default='data')
+    p.add_argument('--data_dir', type=str, default='input')
     p.add_argument('--case', type=str, default='case14')
+    p.add_argument('--train_csv', type=str, default=None, help='Path to training CSV (default: auto-detect clean 2025/07-08 under {data_dir}/{case})')
     p.add_argument('--time_length', type=int, default=96)
     p.add_argument('--stride', type=int, default=48)
     p.add_argument('--batch_size', type=int, default=64)
@@ -60,19 +61,21 @@ def main() -> None:
     p.add_argument('--obs_init_logvar', type=float, default=-3.5)
     p.add_argument('--grad_clip', type=float, default=1e4)
     p.add_argument('--learning_rate', type=float, default=3e-4)
+    # Training uses decoder-variance-adaptive noise at masked positions (no fixed-sigma mode kept)
     # Train
     p.add_argument('--epochs', type=int, default=40)
     p.add_argument('--seed', type=int, default=1337)
     p.add_argument('--exp_name', type=str, default='gru_base_ep40')
-    p.add_argument('--save_dir', type=str, default='models')
     p.add_argument('--device', type=str, default='cpu', choices=['cpu', 'cuda'])
     args = p.parse_args()
 
     set_seed(args.seed)
 
+    # When adaptive_noise_train is enabled, disable dataset noise (sigma=0) and let trainer inject adaptive noise.
     loaders = create_normal_loaders(
         data_dir=args.data_dir,
         case=args.case,
+        train_csv=args.train_csv,
         time_length=args.time_length,
         stride=args.stride,
         batch_size=args.batch_size,
@@ -86,7 +89,7 @@ def main() -> None:
         corr_t=args.corr_t,
         corr_f=args.corr_f,
         noise_kind=args.noise_kind,
-        noise_sigma=args.noise_sigma,
+        noise_sigma=(0.0 if args.noise_kind == 'gaussian' else args.noise_sigma),
         noise_bias_min=args.noise_bias_min,
         noise_bias_max=args.noise_bias_max,
         noise_scale_min=args.noise_scale_min,
@@ -116,9 +119,17 @@ def main() -> None:
     device = resolve_device(args.device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
-    trainer = OnlineTrainer(model, optimizer, device=device, grad_clip=args.grad_clip, beta=args.beta)
+    trainer = OnlineTrainer(
+        model,
+        optimizer,
+        device=device,
+        grad_clip=args.grad_clip,
+        beta=args.beta,
+        adaptive_noise=True,
+    )
 
-    outdir = os.path.join(args.save_dir, args.exp_name)
+    # Enforce output directory layout: output/<case>/models/<exp_name>
+    outdir = os.path.join('output', args.case, 'models', args.exp_name)
     os.makedirs(outdir, exist_ok=True)
 
     train_curve = {'loss': [], 'val': []}

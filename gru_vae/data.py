@@ -1,7 +1,7 @@
 import os
 import random
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 import numpy as np
 import pandas as pd
@@ -306,10 +306,69 @@ def masked_mean_std(x: np.ndarray, m: np.ndarray, eps: float = 1e-6) -> Tuple[np
     return mean.astype(np.float32), std.astype(np.float32)
 
 
+def _list_csv_candidates(folder: str) -> List[str]:
+    if not os.path.isdir(folder):
+        return []
+    out: List[str] = []
+    for name in os.listdir(folder):
+        if name.lower().endswith('.csv'):
+            out.append(os.path.join(folder, name))
+    return out
+
+
+def resolve_training_csv(data_dir: str, case: str, train_csv: Optional[str] = None) -> str:
+    """Resolve training CSV path without hardcoding a specific filename.
+
+    Policy:
+    - If ``train_csv`` is provided, enforce guardrails and return if valid.
+    - Otherwise, search under ``{data_dir}/{case}`` and ``{data_dir}/{case}/train``
+      for a clean 2025/07-08 file (exclude any path containing 'fdia' or '2025-09').
+      Prefer filenames matching 'acopf_2025-07_2025-08_noisy'; fallback to
+      '*2025-07_2025-08*_noisy' (e.g., 'clean_noisy'). Prefer files inside '/train/'.
+    """
+    if train_csv:
+        p = os.path.abspath(train_csv)
+        if not os.path.exists(p):
+            raise SystemExit(f"[error] Training CSV not found: {p}")
+        low = p.lower()
+        if ('fdia' in low) or ('2025-09' in low):
+            raise SystemExit('[error] Training CSV must not contain fdia or 2025-09')
+        return p
+
+    case_dir = os.path.join(data_dir, case)
+    if not os.path.isdir(case_dir):
+        raise SystemExit(f"[error] Case directory not found: {case_dir}")
+
+    candidates: List[str] = []
+    candidates += _list_csv_candidates(case_dir)
+    candidates += _list_csv_candidates(os.path.join(case_dir, 'train'))
+
+    filt: List[str] = []
+    for p in candidates:
+        low = p.lower()
+        if ('2025-07_2025-08' in low) and ('fdia' not in low) and ('2025-09' not in low):
+            filt.append(p)
+    if not filt:
+        raise SystemExit(
+            '[error] Could not locate a clean 2025/07-08 training CSV under '
+            f"{case_dir}. Provide --train_csv explicitly."
+        )
+
+    def _rank(path: str) -> Tuple[int, int, str]:
+        low = os.path.basename(path).lower()
+        pri_name = 0 if 'acopf_2025-07_2025-08_noisy' in low else (1 if '2025-07_2025-08_clean_noisy' in low else 2)
+        pri_dir = 0 if (os.sep + 'train' + os.sep) in path else 1
+        return (pri_name, pri_dir, low)
+
+    filt.sort(key=_rank)
+    return os.path.abspath(filt[0])
+
+
 def create_normal_loaders(
     data_dir: str,
     case: str = 'case14',
     *,
+    train_csv: Optional[str] = None,
     time_length: int = 96,
     stride: int = 48,
     batch_size: int = 64,
@@ -336,7 +395,7 @@ def create_normal_loaders(
     seed: Optional[int] = 1337,
     num_workers: int = 0,
 ) -> DataModule:
-    csv_path = os.path.join(data_dir, case, f'{case}_acopf_all_rows_noisy.csv')
+    csv_path = resolve_training_csv(data_dir, case, train_csv)
     X, M_struct, _ = load_timeseries(csv_path)
     T, H = X.shape
     train_T = int(T * train_ratio)
@@ -407,5 +466,6 @@ __all__ = [
     'SlidingWindowDataset',
     'SelfSupervisedMaskingDataset',
     'create_normal_loaders',
+    'resolve_training_csv',
     'DataModule',
 ]

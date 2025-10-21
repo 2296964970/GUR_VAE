@@ -36,7 +36,7 @@ class OnlineGPVAE(nn.Module):
         enc_layers: int = 1,
         dec_hidden: Tuple[int, ...] = (256, 256),
         beta: float = 1.0,
-        obs_learn_var: bool = False,
+        obs_learn_var: bool = True,
         obs_init_logvar: float = -2.0,
     ) -> None:
         super().__init__()
@@ -58,7 +58,6 @@ class OnlineGPVAE(nn.Module):
             output_dim=self.output_dim,
             z_size=self.latent_dim,
             hidden_sizes=dec_hidden,
-            learn_var=obs_learn_var,
             init_logvar=obs_init_logvar,
         )
         self.prior = SSMPrior(latent_dim=self.latent_dim)

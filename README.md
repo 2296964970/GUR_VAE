@@ -1,97 +1,112 @@
-# GRU-VAE (Online)
+﻿# GRU-VAE: Sequence-Aware FDIA Localization and Repair
 
-Lightweight GRU-VAE for FDIA repair.
+End-to-end GRU-Variational Autoencoder pipeline for power-system measurement streams. The model learns the manifold of clean operating trajectories from physics-informed simulations and repairs stealth FDIA (False Data Injection Attack) contaminations at inference time.
 
-Install: `pip install -e .`
+Key features
+- Sliding-window recurrent encoder-decoder with variational latent space.
+- Self-supervised masking with corruption on masked inputs.
+- Tail-only locate-and-repair utility for attacked streams (no external labels required).
+- Strict training data policy to prevent leakage.
 
-## Training
+---
 
-Example (IEEE14, CPU):
+## Repository Layout
+- `gru_vae/` Core library (data loaders, model, trainer, metrics).
+- `scripts/train.py` Train on clean baselines only.
+- `scripts/tail_only_locate_and_repair.py` Calibrate thresholds on clean tail, detect + repair attacked tails.
+- `scripts/tools/` Validation and preprocessing helpers for CSVs.
+- `interop/` Optional MATLAB-Python interop helpers.
+- `input/` Example datasets and structure description.
+- `output/` All generated artifacts (see Output Policy below).
 
+---
+
+## Installation
+- Python >= 3.10
+- PyTorch (CPU or CUDA)
+- Install dependencies: `pip install -r requirements.txt`
+
+---
+
+## Datasets and Schema
+- Files are UTF-8 without BOM and include a header row.
+- First column: `timestimp` (string), normalized to `YYYY/MM/DD HH:MM`.
+- Remaining columns: numeric features (float), `NaN` denotes missing.
+- Feature dimensions by benchmark:
+  - IEEE 14-bus: 144 features
+  - IEEE 57-bus: 575 features
+  - IEEE 118-bus: 1202 features
+- Row count: 17,857 rows per file (1 header + 17,856 time steps).
+
+Data locations (do not rely on exact filenames)
+- Training (2025/07–08, clean only): under `input/{case}/train/`
+  - Contains clean baselines for July–August. Filenames may vary; no path should contain `fdia` or `2025-09`.
+- Inference (2025/09): under `input/{case}/infer/`
+  - Contains two CSVs with identical timestamps: one non‑`fdia` (clean baseline), one with `fdia` (attacked).
+  - Scripts can auto‑detect these when `--normal_csv`/`--attacked_csv` are omitted.
+
+---
+
+## Training Policy (No Data Leakage)
+- Train only on the 2025/07–08 clean baseline located under `input/{case}/train/`.
+- Never pass any path containing `fdia` or `2025-09` to training utilities (guardrails enforce this).
+- Attacked CSVs are used only for inference and evaluation.
+
+---
+
+## Quickstart
+1) Train
 ```
 python scripts/train.py \
-  --data_dir data \
-  --case case14 \
-  --time_length 96 \
-  --stride 48 \
-  --batch_size 64 \
-  --epochs 40 \
-  --exp_name gru_case14_ep40 \
-  --device cpu
+  --data_dir input --case case14 \
+  --epochs 40 --batch_size 64 --device cpu
 ```
+Checkpoint is saved to `output/<case>/models/<exp_name>/ckpt.pt`.
 
-Note: training always applies synthetic corruption on selected masked positions (no zero-drop path).
-
-Artifacts are saved to `models/gru_case14_ep40/` (e.g., `ckpt.pt`, `training_curve.tsv`).
-
-## Evaluation
-
-Examples on IEEE14:
-
-- Locate + Repair (tail-only, single step)
-
+2) Tail-only Locate + Repair
 ```
 python scripts/tail_only_locate_and_repair.py \
-  --data_dir data \
-  --case case14 \
-  --normal_csv data/case14/case14_acopf_all_rows_noisy.csv \
-  --attacked_csv data/case14/case14_fdia_2025-07_2025-08_noisy.csv \
-  --time_length 24 \
-  --attack_timestamp "2025/08/01 00:00" \
-  --sliding_steps 1 \
-  --alpha 0.01 \
-  --ckpt models/gru_case14_ep40/ckpt.pt \
-  --device cpu
+  --data_dir input --case case14 \
+  --time_length 24 --sliding_steps 6 \
+  --attack_timestamp "2025/09/14 12:00" \
+  --ckpt output/case14/models/gru_base_ep40/ckpt.pt \
+  --tail_scores_wide
 ```
+Notes
+- If `--normal_csv` and `--attacked_csv` are omitted, the script searches under `input/<case>/infer/` for a non‑`fdia` 2025/09 file (clean) and an `fdia` 2025/09 file (attacked).
+Outputs are written under `output/<case>/...`:
+- `output/<case>/repaired/` — repaired tail rows CSV, and optional wide-format repaired/attack/true rows.
+- `output/<case>/tail_scores/` — wide-format tail scores per step when `--tail_scores_wide` is enabled.
 
-- FDIA inference (full timeline)
+---
 
-```
-python scripts/fdia_infer.py \
-  --data_dir data \
-  --case case14 \
-  --attacked_csv data/case14/case14_fdia_2025-07_2025-08_noisy.csv \
-  --time_length 24 \
-  --alpha 0.01 \
-  --ckpt models/gru_case14_ep40/ckpt.pt \
-  --device cpu
-```
+## Interop with MATLAB (optional)
+See `interop/README.md` for exporting CSVs from MATLAB and calling the Python CLI via `run_tail_repair.m`.
 
-- Simulated attacks (point/window) validation
+---
 
-```
-python scripts/validate_simulated_attacks.py \
-  --data_dir data \
-  --case case14 \
-  --time_length 24 \
-  --attack_mode point \
-  --point_rate 0.005 \
-  --noise_kind gaussian \
-  --ckpt models/gru_case14_ep40/ckpt.pt \
-  --device cpu
-```
+## Output Directory Policy (Mandatory)
 
-Training supports `--mask_mode` aliases: `point` (same as `iid`) and `window` (same as `block`).
+All script outputs must be written under the repository `output/` directory, grouped by power-system case and artifact type.
 
-## Notes
+- Case folder: `output/<case>/`
+- Subfolders (created on demand):
+  - `models/` — training checkpoints, logs and curves.
+  - `repaired/` — repaired tail rows and wide-format repaired/attack/true rows.
+  - `thresholds/` — per-feature threshold CSVs.
+  - `tail_scores/` — wide-format tail scores (per step; score/threshold/keep_pred/is_anom).
 
-- Inference/localization entry points:
-  - `scripts/fdia_infer.py` for full-timeline localization+repair on attacked CSVs
-  - `scripts/validate_simulated_attacks.py` to simulate attacks and evaluate
-  - Tail-only evaluation via `scripts/tail_only_locate_and_repair.py`
+Enforcement
+- Training: `scripts/train.py` saves to `output/<case>/models/<exp_name>/`.
+- Inference: `scripts/tail_only_locate_and_repair.py` always writes thresholds, tail scores, and repaired rows into the corresponding `output/<case>/...` subfolders regardless of input CSV locations. Legacy options for custom output folders are removed.
 
-- Locate + Repair (tail-only, sliding multi-step)
+---
 
-```
-python scripts/tail_only_locate_and_repair.py \
-  --data_dir data \
-  --case case14 \
-  --normal_csv data/case14/case14_acopf_all_rows_noisy.csv \
-  --attacked_csv data/case14/case14_fdia_2025-07_2025-08_noisy.csv \
-  --time_length 24 \
-  --attack_timestamp "2025/08/01 00:00" \
-  --sliding_steps 12 \
-  --alpha 0.01 \
-  --ckpt models/gru_case14_ep40/ckpt.pt \
-  --device cpu
-```
+## Encoding and Language
+- All files use UTF-8 without BOM.
+- Code/comments: English. Conversation with AI agents: Chinese (Simplified).
+
+---
+
+## License
+Research use within the GRU-VAE FDIA defense project. See forthcoming license documentation for details.

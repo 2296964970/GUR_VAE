@@ -27,9 +27,9 @@ python case_report.py \
 ```
 data_dir/
 └── case_name/
-    ├── {case}_acopf_all_rows_noisy.csv      # Normal data
-    ├── {case}_fdia_2025-07_2025-08_noisy.csv # Attack data
-    └── {case}_fdia_2025-07_2025-08_labels.csv # Labels
+    ├── {case}_acopf_2025-07_2025-08_noisy.csv # Training data
+    ├── {case}_acopf_2025-09_noisy.csv          # Inference normal data
+    └── {case}_fdia_2025-09_noisy.csv           # Inference attacked data
 ```
 
 **Output example:**
@@ -82,7 +82,7 @@ python case_report.py --data_dir cleaned_data --case case118
 # Check multiple cases
 for case in case14 case30 case57 case118; do
     echo "=== $case ==="
-    python case_report.py --data_dir data --case $case
+    python case_report.py --data_dir input --case $case
 done
 ```
 

@@ -26,8 +26,8 @@ python clean_attacked_labels_pair.py \
 ```
 
 **Output files:**
-- `{case}_fdia_2025-07_2025-08_noisy.csv` - Cleaned attacked data
-- `{case}_fdia_2025-07_2025-08_labels.csv` - Cleaned labels
+- `{case}_fdia_2025-09_noisy.csv` - Cleaned attacked data
+- `{case}_fdia_2025-09_labels.csv` - Cleaned labels (if applicable)
 - Optional copy of normal file if provided
 
 ### sort_and_normalize_csv.py
@@ -93,8 +93,8 @@ python clean_attacked_labels_pair.py \
 
 # 3. Verify
 python ../validation/check_alignment.py \
-    --attacked cleaned/case1_fdia_2025-07_2025-08_noisy.csv \
-    --labels cleaned/case1_fdia_2025-07_2025-08_labels.csv
+    --attacked cleaned/case1_fdia_2025-09_noisy.csv \
+    --labels cleaned/case1_fdia_2025-09_labels.csv
 
 # 4. Generate report
 python ../reporting/case_report.py --data_dir cleaned --case case1

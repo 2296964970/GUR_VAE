@@ -69,33 +69,32 @@ Experiments are conducted on three benchmark power system models: IEEE14, IEEE57
 
 ## Dataset Overview
 - **Source and structure:** Each dataset is generated from optimal power flow calculations on the corresponding IEEE system. The CSV files share an identical schema with a header row. The first column is `timestimp`, followed by feature columns (144 for IEEE14, 575 for IEEE57, and 1202 for IEEE118). IEEE118 files contain 17,857 rows (including the header), with 17,856 chronological time steps; IEEE14 and IEEE57 follow the same row count but adjust the feature dimension.
-- **Dataset1 - Normal data:** Clean baseline measurements for every time step.
-- **Dataset2 - FDIA data:** Measurements corrupted by FDIAs, derived from Dataset1. Attack locations and magnitudes vary across time steps.
-- **Dataset3 - Ideal mask labels for Dataset2:** A binary matrix matching Dataset2's dimensions; `1` denotes an unaltered measurement, `0` indicates an injected value.
-- **Mixed datasets are not currently provided.**
+- **Training data (2025/07-08):** Clean baseline measurements for July-August 2025 (normal only).
+- **Inference data (2025/09):**
+  - Normal: Clean baseline measurements for September 2025 (all time steps are normal).
+  - FDIA: Measurements corrupted by FDIAs (all time steps are attacked).
 
 ---
 
 ## Training Data Policy (No Data Leakage)
 
-To prevent data leakage and preserve the validity of anomaly localization and repair, training MUST use only the clean baseline ("normal") datasets. Attacked datasets and their labels are for inference/evaluation only.
+To prevent data leakage and preserve the validity of anomaly localization and repair, training MUST use only the clean baseline ("normal") datasets from 2025/07-08. Inference datasets (2025/09) are for evaluation only.
 
-- Normal data (training source)
-  - Pattern (all cases): `data/{case}/{case}_acopf_all_rows_noisy.csv`
-  - IEEE 14-bus (current repo): `data/case14/case14_acopf_all_rows_noisy.csv`
+- Training data (2025/07-08, normal only)
+  - Pattern (all cases): `input/{case}/{case}_acopf_2025-07_2025-08_noisy.csv`
+  - IEEE 14-bus (current repo): `input/case14/case14_acopf_2025-07_2025-08_noisy.csv`
 
-- Attacked data (do NOT use for training)
-  - Pattern: `data/{case}/{case}_fdia_*_noisy.csv`
-  - IEEE 14-bus (example): `data/case14/case14_fdia_2025-07_2025-08_noisy.csv`
-
-- Labels (for evaluation only)
-  - Pattern: `data/{case}/{case}_fdia_*_labels.csv`
-  - IEEE 14-bus (example): `data/case14/case14_fdia_2025-07_2025-08_labels.csv`
+- Inference data (2025/09, do NOT use for training)
+  - Normal pattern: `input/{case}/{case}_acopf_2025-09_noisy.csv`
+  - Attacked pattern: `input/{case}/{case}_fdia_2025-09_noisy.csv`
+  - IEEE 14-bus (examples):
+    - `input/case14/case14_acopf_2025-09_noisy.csv`
+    - `input/case14/case14_fdia_2025-09_noisy.csv`
 
 Enforcement guidance
-- The canonical training loader `gru_vae/data.py:create_normal_loaders` reads the normal file (`*_acopf_all_rows_noisy.csv`). Do not change this to any FDIA file.
-- Training scripts must not accept or silently substitute any path containing `fdia` for training.
-- Recommended guardrail: if a training CLI argument points to a file path matching `*fdia*`, raise an error and exit.
+- The canonical training loader `gru_vae/data.py:create_normal_loaders` reads the training file (`*_acopf_2025-07_2025-08_noisy.csv`). Do not change this to any FDIA file or 2025-09 data.
+- Training scripts must not accept or silently substitute any path containing `fdia` or `2025-09` for training.
+- Recommended guardrail: if a training CLI argument points to a file path matching `*fdia*` or `*2025-09*`, raise an error and exit.
 
 Rationale
-- Using attacked CSVs during training would normalize anomalies and degrade both localization and repair. Keeping training strictly on clean baselines ensures the model learns the normal manifold and treats FDIA as distributional deviations at inference time.
+- Using attacked CSVs or inference period data during training would normalize anomalies and degrade both localization and repair. Keeping training strictly on clean baselines from 2025/07-08 ensures the model learns the normal manifold and treats FDIA as distributional deviations at inference time.

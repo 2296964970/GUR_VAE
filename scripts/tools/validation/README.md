@@ -97,31 +97,31 @@ Recommended validation sequence:
 ### 1. Individual File Validation
 ```bash
 # Check time order
-python check_time_order.py --csv data/attacked.csv
+python check_time_order.py --csv input/attacked.csv
 
 # Check time format
-python check_time_format.py --csv data/attacked.csv
+python check_time_format.py --csv input/attacked.csv
 ```
 
 ### 2. Paired File Validation
 ```bash
 # Check alignment between attacked and labels
 python check_alignment.py \
-    --attacked data/attacked.csv \
-    --labels data/labels.csv
+    --attacked input/attacked.csv \
+    --labels input/labels.csv
 
 # Compare timestamps
 python compare_timestamps.py \
-    --csv1 data/attacked.csv \
-    --csv2 data/labels.csv
+    --csv1 input/attacked.csv \
+    --csv2 input/labels.csv
 ```
 
 ### 3. Multi-file Validation
 ```bash
-# Compare normal vs attacked timestamps
+# Compare training vs inference timestamps
 python compare_timestamps.py \
-    --csv1 data/normal.csv \
-    --csv2 data/attacked.csv
+    --csv1 input/case14_acopf_2025-07_2025-08_noisy.csv \
+    --csv2 input/case14_acopf_2025-09_noisy.csv
 ```
 
 ## Common Issues and Solutions
@@ -170,8 +170,8 @@ python processing/clean_attacked_labels_pair.py \
 
 # 3. Re-validate processed data
 python validation/check_alignment.py \
-    --attacked cleaned/case1_fdia_2025-07_2025-08_noisy.csv \
-    --labels cleaned/case1_fdia_2025-07_2025-08_labels.csv
+    --attacked cleaned/case1_fdia_2025-09_noisy.csv \
+    --labels cleaned/case1_fdia_2025-09_labels.csv
 
 # 4. Generate quality report
 python reporting/case_report.py --data_dir cleaned --case case1
