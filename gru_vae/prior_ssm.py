@@ -14,9 +14,10 @@ def _softplus_inverse(value: float, eps: float = 1e-6) -> float:
 
 
 class SSMPrior(nn.Module):
-    """Diagonal AR(1) state-space prior over latent dimensions.
+    """AR(1) state-space prior with optional low-rank coupling of process noise.
 
-    z_t[d] = a[d] * z_{t-1}[d] + eps_t[d],   eps_t[d] ~ N(0, q[d])
+    Dynamics (per latent dim d): z_t[d] = a[d] * z_{t-1}[d] + eps_t[d].
+    Process noise covariance Q = diag(q) + U U^T, where U has rank r (r=0 -> diagonal).
     """
 
     def __init__(
@@ -27,6 +28,7 @@ class SSMPrior(nn.Module):
         q_init: float = 0.1,
         m0_init: float = 0.0,
         P0_init: float = 1.0,
+        rank: int = 4,
         device: Optional[torch.device] = None,
         dtype: torch.dtype = torch.float32,
     ) -> None:
@@ -38,6 +40,7 @@ class SSMPrior(nn.Module):
         if P0_init <= 0.0:
             raise ValueError('P0_init must be positive')
         self.D = int(latent_dim)
+        self.rank = int(rank) if rank is not None else 0
         dev = device if device is not None else torch.device('cpu')
         dt = dtype
         import math as _math
@@ -51,6 +54,14 @@ class SSMPrior(nn.Module):
         self.raw_q = nn.Parameter(torch.full((self.D,), raw_q_init, device=dev, dtype=dt))
         self.m0 = nn.Parameter(torch.full((self.D,), float(m0_init), device=dev, dtype=dt))
         self.raw_P0 = nn.Parameter(torch.full((self.D,), raw_P0_init, device=dev, dtype=dt))
+        # Low-rank factor U for process noise coupling (optional)
+        if self.rank > 0:
+            U = torch.zeros(self.D, self.rank, device=dev, dtype=dt)
+            # small random init
+            nn.init.normal_(U, mean=0.0, std=0.05)
+            self.U = nn.Parameter(U)
+        else:
+            self.register_parameter('U', None)
 
     def transition_params(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         a = torch.tanh(self.raw_a)
@@ -77,6 +88,7 @@ class SSMPrior(nn.Module):
         a, q, _m0, _P0 = self.transition_params()
         a2 = a * a
         m_pred = m_prev * a
+        # Diagonal prediction for the state variance component
         P_pred = P_prev * a2 + q
         return m_pred, P_pred
 
@@ -97,7 +109,57 @@ class SSMPrior(nn.Module):
         if not (mu_q.shape == logvar_q.shape == m_pred.shape == P_pred.shape):
             raise ValueError('All inputs must share shape [B,D]')
         s2_q = torch.exp(logvar_q)
-        return self._kl_diag(mu_q, s2_q, m_pred, P_pred)
+        # If no low-rank factor, fall back to diagonal KL
+        if (self.rank <= 0) or (self.U is None):
+            return self._kl_diag(mu_q, s2_q, m_pred, P_pred)
+
+        # Sigma_p = diag(P_pred) + U U^T (low-rank update)
+        B, D = mu_q.shape
+        r = int(self.rank)
+        # Clamp for numerical stability
+        Ddiag = P_pred.clamp_min(1e-12)
+        Dinv = 1.0 / Ddiag
+        # Expand U across batch
+        U = self.U  # [D, r]
+        U_b = U.unsqueeze(0).expand(B, -1, -1)  # [B, D, r]
+        # A = D^{-1} U
+        A = Dinv.unsqueeze(-1) * U_b  # [B, D, r]
+        # M = I + U^T D^{-1} U = I + U^T A
+        UT_A = torch.einsum('bdr,bdq->brq', U_b, A)  # [B, r, r]
+        I = torch.eye(r, device=UT_A.device, dtype=UT_A.dtype).unsqueeze(0).expand(B, -1, -1)
+        M = I + UT_A
+        Minv = torch.linalg.inv(M)  # [B, r, r]
+
+        # log|Sigma_p| = log|D| + log|M|
+        logdet_D = torch.log(Ddiag).sum(dim=-1)  # [B]
+        # batched logdet via slogdet
+        sign, logabs = torch.linalg.slogdet(M)
+        logdet_M = logabs
+        logdet_p = logdet_D + logdet_M  # [B]
+
+        # log|Sigma_q|
+        logdet_q = torch.log(s2_q.clamp_min(1e-12)).sum(dim=-1)
+
+        # diag(inv(Sigma_p)) = D^{-1} - diag(A Minv A^T)
+        tmp = torch.einsum('bdr,brq->bdq', A, Minv)  # [B, D, r]
+        diagK = torch.sum(tmp * A, dim=-1)  # [B, D]
+        diag_inv = Dinv - diagK  # [B, D]
+
+        # tr(inv(Sigma_p) Sigma_q) where Sigma_q=diag(s2_q)
+        tr_term = (diag_inv * s2_q).sum(dim=-1)  # [B]
+
+        # quadratic term (mu_q - m_p)^T inv(Sigma_p) (mu_q - m_p)
+        diff = (mu_q - m_pred)
+        v = Dinv * diff  # [B, D]
+        b_vec = torch.einsum('bdr,bd->br', A, diff)  # [B, r]
+        w = torch.linalg.solve(M, b_vec)  # [B, r]
+        Aw = torch.einsum('bdr,br->bd', A, w)  # [B, D]
+        inv_times_diff = v - Aw  # [B, D]
+        quad = (diff * inv_times_diff).sum(dim=-1)  # [B]
+
+        Dn = D
+        kl = 0.5 * (logdet_p - logdet_q - float(Dn) + tr_term + quad)
+        return kl
 
 
 __all__ = ['SSMPrior']

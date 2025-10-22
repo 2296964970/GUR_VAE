@@ -36,8 +36,8 @@ class OnlineGPVAE(nn.Module):
         enc_layers: int = 1,
         dec_hidden: Tuple[int, ...] = (256, 256),
         beta: float = 1.0,
-        obs_learn_var: bool = True,
         obs_init_logvar: float = -2.0,
+        enc_use_mask: bool = True,
     ) -> None:
         super().__init__()
         if input_dim <= 0 or output_dim <= 0 or latent_dim <= 0:
@@ -48,8 +48,11 @@ class OnlineGPVAE(nn.Module):
         self.output_dim = int(output_dim)
         self.latent_dim = int(latent_dim)
         self.beta = float(beta)
+        self.enc_use_mask = bool(enc_use_mask)
+        # Encoder consumes [x*mask, mask] if enc_use_mask, else only x
+        self.enc_input_dim = (self.input_dim * 2) if self.enc_use_mask else self.input_dim
         self.encoder: nn.Module = CausalGRUEncoder(
-            input_dim=self.input_dim,
+            input_dim=self.enc_input_dim,
             z_size=self.latent_dim,
             hidden_size=enc_hidden_size,
             num_layers=enc_layers,
@@ -89,7 +92,13 @@ class OnlineGPVAE(nn.Module):
             raise ValueError('x_t.shape[1] does not match input_dim')
         h = state['h']
         m_prev, P_prev = state['m'], state['P']
-        mu_t, logvar_t, h_new = self.encoder.step(x_t, h)  # type: ignore[attr-defined]
+        # Prepare encoder input: gate and concat mask if enabled
+        if self.enc_use_mask:
+            x_eff = x_t * mask_t
+            enc_in = torch.cat([x_eff, mask_t], dim=-1)
+        else:
+            enc_in = x_t
+        mu_t, logvar_t, h_new = self.encoder.step(enc_in, h)  # type: ignore[attr-defined]
         m_pred, P_pred = self.prior.predict(m_prev, P_prev)
         kl_t = self.prior.kl_q_prior(mu_t, logvar_t, m_pred, P_pred)
         z_t = mu_t if use_mean else self._reparameterize(mu_t, logvar_t)

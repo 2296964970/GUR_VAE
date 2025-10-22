@@ -375,7 +375,7 @@ def create_normal_loaders(
     train_ratio: float = 0.7,
     val_ratio: float = 0.15,
     mask_rate: float = 0.2,
-    mask_mode: str = 'iid',
+    mask_mode: str = 'block',
     block_t_min: int = 2,
     block_t_max: int = 8,
     block_f_min: int = 4,

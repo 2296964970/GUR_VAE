@@ -28,7 +28,7 @@ def main() -> None:
     p.add_argument('--stride', type=int, default=48)
     p.add_argument('--batch_size', type=int, default=64)
     p.add_argument('--mask_rate', type=float, default=0.3)
-    p.add_argument('--mask_mode', type=str, default='iid', choices=['iid', 'block', 'corr', 'point', 'window'])
+    p.add_argument('--mask_mode', type=str, default='block', choices=['iid', 'block', 'corr', 'point', 'window'])
     # Block mask params
     p.add_argument('--block_t_min', type=int, default=2)
     p.add_argument('--block_t_max', type=int, default=8)
@@ -54,10 +54,6 @@ def main() -> None:
     p.add_argument('--gru_hidden', type=int, default=256)
     p.add_argument('--gru_layers', type=int, default=1)
     p.add_argument('--beta', type=float, default=0.1)
-    # Observation variance
-    p.add_argument('--obs_learn_var', dest='obs_learn_var', action='store_true', help='Learn observation variance (default)')
-    p.add_argument('--no-obs_learn_var', dest='obs_learn_var', action='store_false', help='Use fixed observation variance')
-    p.set_defaults(obs_learn_var=True)
     p.add_argument('--obs_init_logvar', type=float, default=-3.5)
     p.add_argument('--grad_clip', type=float, default=1e4)
     p.add_argument('--learning_rate', type=float, default=3e-4)
@@ -112,7 +108,6 @@ def main() -> None:
         enc_layers=args.gru_layers,
         dec_hidden=dec_hidden,
         beta=args.beta,
-        obs_learn_var=args.obs_learn_var,
         obs_init_logvar=args.obs_init_logvar,
     )
 
@@ -136,7 +131,24 @@ def main() -> None:
     best_val = float('inf')
     best_state = None
 
+    # Built-in schedules (no extra CLI):
+    # - KL warm-up: linear 0 -> beta over first ~20% epochs
+    # - Mask curriculum (for block/corr): linear from max(target, 0.4) -> target across training
+    warmup_epochs = max(1, int(round(args.epochs * 0.2)))
+    start_mask_rate = 0.4 if args.mask_mode in ('block', 'corr', 'window') else args.mask_rate
     for epoch in range(1, args.epochs + 1):
+        # Update beta schedule
+        cur_beta = args.beta * min(1.0, epoch / float(warmup_epochs))
+        trainer.beta = cur_beta
+        # Update curriculum mask rate
+        if hasattr(loaders.train, 'dataset') and hasattr(loaders.train.dataset, 'mask_rate'):
+            if args.mask_mode in ('block', 'corr', 'window'):
+                if args.epochs > 1:
+                    progress = (epoch - 1) / float(args.epochs - 1)
+                else:
+                    progress = 1.0
+                cur_mask_rate = start_mask_rate + (args.mask_rate - start_mask_rate) * progress
+                loaders.train.dataset.mask_rate = float(cur_mask_rate)
         tr = trainer.train_epoch(loaders.train)
         va = trainer.evaluate(loaders.val)
         train_curve['loss'].append(tr.loss)

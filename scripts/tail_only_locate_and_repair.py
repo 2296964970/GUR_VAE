@@ -149,35 +149,88 @@ def _calibrate_thresholds_normal(
     if not (0.0 < alpha < 1.0):
         raise SystemExit('[error] alpha must be in (0,1)')
     mask_valid = (Mn_struct > 0.5) & np.isfinite(scores)
-    # Per-feature quantile thresholds (fallback to global quantile for sparse features)
+    # Store empirical samples per feature for BH-FDR p-value computation
+    samples: Dict[str, np.ndarray] = {}
     thr: Dict[str, float] = {}
-    for h in range(Xn_std.shape[1]):
-        col = scores[:, h]
-        mcol = mask_valid[:, h]
-        vals = col[mcol]
-        if vals.size >= int(min_count_per_feature):
-            thr[feature_names[h]] = float(np.quantile(vals, 1.0 - alpha))
-    if len(thr) < Xn_std.shape[1]:
+    for h in range(H):
+        name = feature_names[h]
+        vals = scores[:, h][mask_valid[:, h]]
+        if vals.size > 0:
+            arr = np.sort(vals.astype(np.float64))
+            samples[name] = arr
+            # Equivalent (1-alpha) quantile per feature (for reporting only)
+            thr[name] = float(np.quantile(arr, 1.0 - alpha))
+    # Fallback: global threshold if some features lack samples
+    if len(samples) < H:
         all_vals = scores[mask_valid]
-        tau = float(np.quantile(all_vals, 1.0 - alpha))
-        for h in range(Xn_std.shape[1]):
+        if np.any(np.isfinite(all_vals)):
+            tau = float(np.quantile(all_vals, 1.0 - alpha))
+        else:
+            tau = float('inf')
+        for h in range(H):
             name = feature_names[h]
             if name not in thr:
                 thr[name] = tau
-    return {'type': 'per_feature', 'alpha': float(alpha), 'thresholds': thr}
+    return {
+        'type': 'empirical',
+        'alpha': float(alpha),
+        'samples': samples,
+        'thresholds': thr,
+        'min_count': int(min_count_per_feature),
+    }
 
 
-def _apply_thresholds(scores_tail: np.ndarray, m_tail: np.ndarray, meta: Dict[str, object], feature_names: List[str]) -> np.ndarray:
-    A = np.zeros_like(scores_tail, dtype=np.float64)
-    A[:] = np.nan
-    obs = m_tail > 0.5
-    thr: Dict[str, float] = meta['thresholds']
-    for h, name in enumerate(feature_names):
-        if not obs[h]:
-            continue
-        tau_h = float(thr[name])
-        A[h] = float(scores_tail[h] <= tau_h)
-    return A
+def _bh_fdr_keep_pred(scores_tail: np.ndarray, m_tail: np.ndarray, meta: Dict[str, object], feature_names: List[str]) -> np.ndarray:
+    """Compute keep_pred via BH-FDR using empirical tail-score distributions.
+
+    Returns keep_pred[H] in {0.0,1.0} (np.nan for unobserved), where 0.0 indicates drop/anomaly.
+    """
+    alpha = float(meta.get('alpha', 0.05))
+    samples: Dict[str, np.ndarray] = meta.get('samples', {})  # type: ignore[assignment]
+    H = len(feature_names)
+    keep = np.full((H,), np.nan, dtype=np.float64)
+    obs_idx = np.where(m_tail > 0.5)[0]
+    if obs_idx.size == 0:
+        return keep
+    # Compute empirical upper-tail p-values
+    pvals = []
+    idx_list = []
+    for h in obs_idx:
+        name = feature_names[h]
+        s_h = float(scores_tail[h])
+        arr = samples.get(name, None)
+        if arr is None or arr.size == 0:
+            # fallback: p-value unknown -> use 1.0 (most conservative keep)
+            p = 1.0
+        else:
+            # p = 1 - F_hat(s)
+            # equivalent to proportion of samples > s_h
+            # use searchsorted for sorted arr
+            k = int(np.searchsorted(arr, s_h, side='right'))
+            F = k / max(len(arr), 1)
+            p = max(0.0, min(1.0, 1.0 - F))
+        pvals.append(p)
+        idx_list.append(h)
+    pvals = np.array(pvals, dtype=np.float64)
+    m = len(pvals)
+    if m == 0:
+        return keep
+    order = np.argsort(pvals)
+    sorted_p = pvals[order]
+    thresh = alpha * (np.arange(1, m + 1) / float(m))
+    # Largest k with p_(k) <= thresh_k
+    k_max = np.where(sorted_p <= thresh)[0]
+    reject = np.zeros_like(sorted_p, dtype=bool)
+    if k_max.size > 0:
+        k = int(k_max.max())
+        reject[:k + 1] = True
+    # Assign keep_pred: reject -> anomaly (drop -> 0.0), else keep 1.0
+    keep_obs = (~reject).astype(np.float64)
+    # Map back to feature indices
+    for rank, pos in enumerate(order):
+        h = idx_list[pos]
+        keep[h] = keep_obs[rank]
+    return keep
 
 
 MC_SAMPLES = 16
@@ -286,9 +339,6 @@ def main() -> None:
     p.add_argument('--gru_hidden', type=int, default=256)
     p.add_argument('--gru_layers', type=int, default=1)
     p.add_argument('--beta', type=float, default=0.1)
-    p.add_argument('--obs_learn_var', dest='obs_learn_var', action='store_true')
-    p.add_argument('--no-obs_learn_var', dest='obs_learn_var', action='store_false')
-    p.set_defaults(obs_learn_var=True)
     p.add_argument('--obs_init_logvar', type=float, default=-3.5)
     p.add_argument('--ckpt', type=str, default='')
     p.add_argument('--batch_size', type=int, default=64)
@@ -404,7 +454,6 @@ def main() -> None:
         enc_layers=args.gru_layers,
         dec_hidden=tuple(dec_hidden),
         beta=args.beta,
-        obs_learn_var=args.obs_learn_var,
         obs_init_logvar=args.obs_init_logvar,
     )
     model.to(device)
@@ -489,7 +538,7 @@ def main() -> None:
 
         scores_tail, logv_tail = _compute_tail_scores_window(model, X_T_std, M_T_struct, device=device)
         m_tail = M_T_struct[-1]
-        pred_tail = _apply_thresholds(scores_tail, m_tail, thresholds_meta, feat_names)
+        pred_tail = _bh_fdr_keep_pred(scores_tail, m_tail, thresholds_meta, feat_names)
         m_imp = M_T_struct.copy()
         m_tail_obs = m_tail > 0.5
         if not np.any(m_tail_obs):
