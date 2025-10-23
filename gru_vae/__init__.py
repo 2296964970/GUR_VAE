@@ -1,3 +1,1 @@
-from . import noise as noise  # re-export noise module
-
-__all__ = ['noise']
+__all__: list[str] = []

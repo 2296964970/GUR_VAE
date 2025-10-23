@@ -1,7 +1,7 @@
 # MATLAB-Python Interop (GRU-VAE)
 
 Purpose
-- Bridge MATLAB time-series (e.g., loadseries) with this Python GRU-VAE pipeline for training and FDIA repair.
+- Bridge MATLAB time-series (e.g., loadseries) with this Python GRU-VAE pipeline for training and reconstruction-based evaluation.
 
 Data Contract (CSV)
 - First column: timestamp string, normalized to `YYYY/MM/DD HH:MM`.
@@ -29,31 +29,27 @@ Preprocess & Validate (optional but recommended)
 
 Training (Python)
 - Install deps: `pip install -r requirements.txt`
-- Train strictly on Normal CSV (no FDIA paths):
-  - `python scripts/train.py --data_dir input --case case14 --epochs 40 --device cpu`
-  - Checkpoint saved to `output/<case>/models/<exp_name>/ckpt.pt`.
+- Train on paired CSVs (attacked as input, normal as target, July–August only):
+  - Configure `config.yaml` with `train.normal_csv` and `train.attacked_csv`.
+  - Run: `python scripts/train.py`
+  - Checkpoint saved to `output/<case>/models/<exp_name>/ckpt.pt` with `mean.npy/std.npy`.
 
-Tail-Only Repair (Python CLI)
-- CLI: `scripts/tail_only_locate_and_repair.py`
-- Minimal example:
-  - `python scripts/tail_only_locate_and_repair.py --data_dir input --case case14 --normal_csv input/case14/case14_acopf_2025-09_noisy.csv --attacked_csv input/case14/case14_fdia_2025-09_noisy.csv --time_length 24 --sliding_steps 6 --attack_timestamp "2025/09/14 12:00" --ckpt output/case14/models/gru_base_ep40/ckpt.pt --tail_scores_wide`
-- Outputs:
-  - Repaired tail rows CSV under `output/<case>/repaired/` (one row per step).
-  - Optional wide CSVs written to `output/<case>/tail_scores/` (scores/threshold/keep_pred/is_anom) and to `output/<case>/repaired/` (attacked/true/repaired tails) when `--tail_scores_wide` is set.
-
-MATLAB Wrapper (system call)
-- Use `interop/matlab/run_tail_repair.m` to invoke the Python CLI from MATLAB.
+Windowed Reconstruction (Python CLI)
+- Script: `scripts/infer_reconstruct.py`
 - Example:
-  - `[status, cmdout] = run_tail_repair('python', pwd, ...
-      'DataDir','input', 'Case','case14', 'NormalCsv','input/case14/case14_acopf_2025-09_noisy.csv', ...
-      'AttackedCsv','input/case14/case14_fdia_2025-09_noisy.csv', ...
-      'Ckpt','output/case14/models/gru_base_ep40/ckpt.pt', 'AttackTimestamp','2025/09/14 12:00', ...
-      'TimeLength',24, 'SlidingSteps',6, 'TailScoresWide',true);`
+  - Configure `infer.normal_csv`, `infer.attacked_csv`, `infer.end_timestamp`, `infer.length` in `config.yaml`.
+  - Run: `python scripts/infer_reconstruct.py`
+- Outputs under `output/<case>/infer/<exp_name>/`:
+  - `metrics.csv` with per-timestamp MSE/MAE/RMSE/MAPE/MSPE and a bottom mean row.
+  - `reconstructed_window.csv`, `attacked_window.csv`, `normal_window.csv`.
+
+MATLAB Wrapper (optional)
+- Example templates in `interop/matlab/` can be adapted to call `scripts/train.py` and `scripts/infer_reconstruct.py` via `system()`.
 
 Environment Notes
 - Ensure Python is visible to MATLAB (`pyenv`), or pass full path to the `python` executable in `run_tail_repair`.
 - On Windows, keep double-quoted paths; this README uses forward slashes which Python supports on Windows.
 
 Training Data Policy
-- Do not train on any `fdia` CSV. Training uses only the clean baseline file.
+- Train on 2025/07–08 data. Training normal CSV must not contain `fdia` or `2025-09`. Training attacked CSV may include `fdia` but must not contain `2025-09`.
 

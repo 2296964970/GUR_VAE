@@ -62,7 +62,12 @@ State estimation underlies operational decision making in modern power systems, 
 
 ## Current Project Description
 
-The repository implements an end-to-end GRU-Variational Autoencoder pipeline tailored to IEEE benchmark grids. Data loaders in `gru_vae/data.py` curate sliding-window sequences solely from the clean `*_acopf_all_rows_noisy.csv` files to prevent leakage. The training scripts optimize a gated recurrent encoder-decoder with reconstruction and KL terms, producing latent priors that characterize normal measurement evolution. Inference utilities apply the trained model to FDIA-contaminated streams, score each timestamp-feature pair, and generate repair masks that replace suspicious readings with reconstructed estimates. Configuration files and notebooks document hyperparameters, windowing strategy, and evaluation workflows so that new experiments on IEEE14, IEEE57, and IEEE118 cases can be reproduced consistently across the experimental-playground branch.
+The repository implements an end-to-end GRU-Variational Autoencoder pipeline tailored to IEEE benchmark grids. The codebase now uses explicit paired datasets (attacked and normal) with strict timestamp alignment for both training and inference. Data utilities in `gru_vae/data.py` provide:
+
+- `load_paired_timeseries(normal_csv, attacked_csv)`: validates identical headers, shapes, timestamps, and observability masks.
+- `create_paired_loaders(...)`: builds sliding-window datasets where the model takes attacked inputs and learns to reconstruct the aligned normal targets.
+
+Training optimizes a causal GRU encoder + Gaussian decoder with KL regularization. The supervised ELBO uses observed-only reconstruction loss: only positions marked observable contribute to the negative log-likelihood. Inference scripts reconstruct attacked sequences over a user-specified time window and report observed-space metrics against the aligned normal slice. A single `config.yaml` controls data paths, windowing, model hyperparameters, training schedule, and inference windowing.
 
 ## Experimental Scope
 Experiments are conducted on three benchmark power system models: IEEE14, IEEE57, and IEEE118. For each system, five datasets provide complementary perspectives on normal operation, attacked measurements, and idealized ground-truth labels.
@@ -76,25 +81,25 @@ Experiments are conducted on three benchmark power system models: IEEE14, IEEE57
 
 ---
 
-## Training Data Policy (No Data Leakage)
+## Training and Inference Data Policy (No Data Leakage)
 
-To prevent data leakage and preserve the validity of anomaly localization and repair, training MUST use only the clean baseline ("normal") datasets from 2025/07-08. Inference datasets (2025/09) are for evaluation only.
+To prevent leakage across calendar periods while supporting supervised reconstruction, the current implementation uses paired attacked/normal data from 2025/07–2025/08 for training and reserves 2025/09 for evaluation only.
 
-- Training data (2025/07-08, normal only)
-  - Pattern (all cases): `input/{case}/{case}_acopf_2025-07_2025-08_noisy.csv`
-  - IEEE 14-bus (current repo): `input/case14/case14_acopf_2025-07_2025-08_noisy.csv`
+- Training data (2025/07–08, paired and aligned)
+  - Normal pattern (example): `input/{case}/train/*_2025-07_2025-08_clean_noisy.csv`
+  - Attacked pattern (example): `input/{case}/train/*_fdia_2025-07_2025-08_noisy.csv`
+  - The two CSVs must have identical headers and timestamps and share the same observability mask.
+  - Loss is computed only on observed positions, with the model learning to map attacked inputs to normal targets.
 
 - Inference data (2025/09, do NOT use for training)
-  - Normal pattern: `input/{case}/{case}_acopf_2025-09_noisy.csv`
-  - Attacked pattern: `input/{case}/{case}_fdia_2025-09_noisy.csv`
-  - IEEE 14-bus (examples):
-    - `input/case14/case14_acopf_2025-09_noisy.csv`
-    - `input/case14/case14_fdia_2025-09_noisy.csv`
+  - Normal pattern (example): `input/{case}/infer/*_2025-09_clean_noisy.csv`
+  - Attacked pattern (example): `input/{case}/infer/*_fdia_2025-09_noisy.csv`
+  - Inference selects a window by `infer.end_timestamp` and `infer.length` in `config.yaml`, reconstructs attacked inputs, and evaluates metrics against the aligned normal slice on observed positions only.
 
 Enforcement guidance
-- The canonical training loader `gru_vae/data.py:create_normal_loaders` reads the training file (`*_acopf_2025-07_2025-08_noisy.csv`). Do not change this to any FDIA file or 2025-09 data.
-- Training scripts must not accept or silently substitute any path containing `fdia` or `2025-09` for training.
-- Recommended guardrail: if a training CLI argument points to a file path matching `*fdia*` or `*2025-09*`, raise an error and exit.
+- Training uses `gru_vae/data.py:create_paired_loaders`, which expects explicit normal and attacked CSVs for 07–08 and validates alignment.
+- Configuration validation in `gru_vae/config.py:_validate_training_policy` forbids any `2025-09` paths in training and forbids `fdia` in the training normal CSV. Attacked CSVs are allowed to contain `fdia` only for the 07–08 training period.
+- Both CSVs must share schema and timestamps; the loader aborts on mismatch.
 
 Rationale
-- Using attacked CSVs or inference period data during training would normalize anomalies and degrade both localization and repair. Keeping training strictly on clean baselines from 2025/07-08 ensures the model learns the normal manifold and treats FDIA as distributional deviations at inference time.
+- Supervised pairing (attacked→normal) trains the model to reconstruct nominal trajectories while preserving generalization to 09 by isolating evaluation to the inference period. Observed-only losses avoid penalizing unobserved entries.

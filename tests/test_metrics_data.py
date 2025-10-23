@@ -1,6 +1,6 @@
 import torch
 from gru_vae.metrics import gaussian_nll_observed, mse_missing, mse_observed
-from gru_vae.data import SelfSupervisedMaskingDataset
+from gru_vae.data import PairedSlidingWindowDataset
 import numpy as np
 
 
@@ -20,12 +20,13 @@ def test_metrics_mask_semantics():
     assert torch.allclose(mo, torch.ones(B))
 
 
-def test_self_supervised_dataset_tuple_shapes():
+def test_paired_dataset_tuple_shapes():
     T, H = 20, 4
-    x = np.random.randn(T, H).astype(np.float32)
+    xa = np.random.randn(T, H).astype(np.float32)
+    xn = np.random.randn(T, H).astype(np.float32)
     m = np.ones((T, H), dtype=np.float32)
-    ds = SelfSupervisedMaskingDataset(x, m, window=8, stride=4, mask_rate=0.5, seed=123)
-    xm, ms, xt = ds[0]
-    assert xm.shape == (8, H)
-    assert ms.shape == (8, H)
-    assert xt.shape == (8, H)
+    ds = PairedSlidingWindowDataset(xa, xn, m, window=8, stride=4)
+    xa_w, m_w, xn_w = ds[0]
+    assert xa_w.shape == (8, H)
+    assert m_w.shape == (8, H)
+    assert xn_w.shape == (8, H)
