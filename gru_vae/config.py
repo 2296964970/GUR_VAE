@@ -82,6 +82,7 @@ def _defaults() -> Dict[str, Any]:
         # Inference window
         'infer_end_timestamp': '',
         'infer_length': 96,
+        'infer_mc_samples': 8,
     }
 
 
@@ -108,6 +109,7 @@ def _flatten_config(raw: Dict[str, Any]) -> Dict[str, Any]:
     d['infer_attacked_csv'] = _deep_get(raw, 'infer.attacked_csv', d['infer_attacked_csv'])
     d['infer_end_timestamp'] = str(_deep_get(raw, 'infer.end_timestamp', d['infer_end_timestamp']))
     d['infer_length'] = int(_deep_get(raw, 'infer.length', d['infer_length']))
+    d['infer_mc_samples'] = int(_deep_get(raw, 'infer.mc_samples', d['infer_mc_samples']))
 
     # Window
     d['time_length'] = int(_deep_get(raw, 'window.time_length', d['time_length']))

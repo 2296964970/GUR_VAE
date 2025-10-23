@@ -70,7 +70,7 @@ def main() -> None:
     best_val = float('inf')
     best_state = None
 
-    # Built-in schedule:
+    # Built-in schedule (no toggle):
     # - KL warm-up: linear 0 -> beta over first ~20% epochs
     warmup_epochs = max(1, int(round(args.epochs * 0.2)))
     for epoch in range(1, args.epochs + 1):
@@ -81,8 +81,12 @@ def main() -> None:
         va = trainer.evaluate(loaders.val)
         train_curve['loss'].append(tr.loss)
         train_curve['val'].append(va.loss)
-        print(f'Epoch {epoch:03d} | train loss {tr.loss:.4f} (nll {tr.nll:.4f}, kl {tr.kl:.4f}) | '
-              f'val loss {va.loss:.4f} (nll {va.nll:.4f}, kl {va.kl:.4f}) | mse_obs val {va.mse_obs:.6f}')
+        print(
+            f'Epoch {epoch:03d} | beta {cur_beta:.4f} | '
+            f'train loss {tr.loss:.4f} (nll {tr.nll:.4f}, kl {tr.kl:.4f}) | '
+            f'val loss {va.loss:.4f} (nll {va.nll:.4f}, kl {va.kl:.4f}) | '
+            f'mse_obs val {va.mse_obs:.6f}'
+        )
         if va.loss < best_val:
             best_val = va.loss
             best_state = {
@@ -101,9 +105,14 @@ def main() -> None:
             'dec_hidden': args.dec_hidden,
         })
         torch.save(best_state, os.path.join(outdir, 'ckpt.pt'))
-        # Save standardization statistics
-        np.save(os.path.join(outdir, 'mean.npy'), loaders.mean)
-        np.save(os.path.join(outdir, 'std.npy'), loaders.std)
+        # Save slot-wise robust standardization statistics
+        np.savez_compressed(
+            os.path.join(outdir, 'slot_stats.npz'),
+            mean=loaders.slot_mean,
+            std=loaders.slot_std,
+            slot_kind=str(getattr(loaders, 'slot_kind', 'hour')),
+            clip_k=float(getattr(loaders, 'clip_k', 5.0)),
+        )
 
     if best_state is not None:
         model.load_state_dict(best_state['model'])

@@ -37,7 +37,6 @@ class OnlineGPVAE(nn.Module):
         dec_hidden: Tuple[int, ...] = (256, 256),
         beta: float = 1.0,
         obs_init_logvar: float = -2.0,
-        enc_use_mask: bool = True,
     ) -> None:
         super().__init__()
         if input_dim <= 0 or output_dim <= 0 or latent_dim <= 0:
@@ -48,9 +47,8 @@ class OnlineGPVAE(nn.Module):
         self.output_dim = int(output_dim)
         self.latent_dim = int(latent_dim)
         self.beta = float(beta)
-        self.enc_use_mask = bool(enc_use_mask)
-        # Encoder consumes [x*mask, mask] if enc_use_mask, else only x
-        self.enc_input_dim = (self.input_dim * 2) if self.enc_use_mask else self.input_dim
+        # Always use mask-aware encoder input: concat [x*mask, mask]
+        self.enc_input_dim = self.input_dim * 2
         self.encoder: nn.Module = CausalGRUEncoder(
             input_dim=self.enc_input_dim,
             z_size=self.latent_dim,
@@ -93,11 +91,9 @@ class OnlineGPVAE(nn.Module):
         h = state['h']
         m_prev, P_prev = state['m'], state['P']
         # Prepare encoder input: gate and concat mask if enabled
-        if self.enc_use_mask:
-            x_eff = x_t * mask_t
-            enc_in = torch.cat([x_eff, mask_t], dim=-1)
-        else:
-            enc_in = x_t
+        # Mask-aware encoder input: gate x with mask and concatenate mask
+        x_eff = x_t * mask_t
+        enc_in = torch.cat([x_eff, mask_t], dim=-1)
         mu_t, logvar_t, h_new = self.encoder.step(enc_in, h)  # type: ignore[attr-defined]
         m_pred, P_pred = self.prior.predict(m_prev, P_prev)
         kl_t = self.prior.kl_q_prior(mu_t, logvar_t, m_pred, P_pred)
@@ -164,14 +160,12 @@ class OnlineGPVAE(nn.Module):
         mask_keep: torch.Tensor,
         x_target: torch.Tensor,
         *,
-        supervise: str = 'miss',
         beta: Optional[float] = None,
     ) -> Dict[str, torch.Tensor]:
-        """ELBO with decoupled input/target for self-supervised training.
+        """ELBO with decoupled input/target on observed positions only.
 
-        - Encoder/step consumes `x_input` with `mask_keep`.
-        - NLL is computed against `x_target` using either observed (keep) or
-          missing (1-keep) positions depending on `supervise`.
+        - Encoder consumes `x_input` with `mask_keep`.
+        - NLL is computed against `x_target` on observed entries (mask_keep>0.5).
         """
         if not (x_input.shape == mask_keep.shape == x_target.shape):
             raise ValueError('x_input, mask_keep, x_target must share shape [B,T,H]')
@@ -194,9 +188,8 @@ class OnlineGPVAE(nn.Module):
             mu_seq[:, :, t] = aux['mu_t']
             logvar_seq[:, :, t] = aux['logvar_t']
             kl_acc += aux['kl_t']
-        if supervise not in ('obs', 'miss'):
-            raise ValueError("supervise must be 'obs' or 'miss'")
-        mask_loss = mask_keep if supervise == 'obs' else (mask_keep <= 0.5).to(dtype=mask_keep.dtype)
+        # Loss on observed positions only
+        mask_loss = mask_keep
         nll_b = gaussian_nll_observed(mean_seq, logvar_x_seq, x_target, mask_loss)
         beta_val = float(self.beta if beta is None else beta)
         loss_b = nll_b + beta_val * kl_acc
@@ -222,7 +215,8 @@ class OnlineGPVAE(nn.Module):
             x_t = x[:, t, :]
             m_t = mask[:, t, :]
             yhat_t, state, _ = self.step(x_t, m_t, state, use_mean=use_mean)
-            out[:, t, :] = torch.where(m_t > 0.5, x_t, yhat_t)
+            # Predict all positions (no forced passthrough of observed)
+            out[:, t, :] = yhat_t
         return out
 
 

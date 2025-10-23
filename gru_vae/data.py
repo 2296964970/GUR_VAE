@@ -59,24 +59,8 @@ def _make_worker_init_fn(base_seed: Optional[int]):
 
 class SlidingWindowDataset(Dataset):
     def __init__(self, x: np.ndarray, m: np.ndarray, window: int, stride: int = 1):
-        if x.shape != m.shape:
-            raise ValueError('x and m must have identical shapes [T,H]')
-        self.T, self.H = x.shape
-        self.window = int(window)
-        self.stride = int(stride)
-        self.starts = _window_indices(self.T, self.window, self.stride)
-        self.x = torch.from_numpy(x)
-        self.m = torch.from_numpy(m)
-
-    def __len__(self) -> int:
-        return len(self.starts)
-
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, ...]:
-        s = self.starts[idx]
-        e = s + self.window
-        xw = self.x[s:e]
-        mw = self.m[s:e]
-        return xw, mw
+        # Deprecated in favor of PairedSlidingWindowDataset
+        raise NotImplementedError('SlidingWindowDataset is deprecated; use PairedSlidingWindowDataset')
 
 
 class PairedSlidingWindowDataset(Dataset):
@@ -112,6 +96,20 @@ class DataModule:
     test: DataLoader
     mean: np.ndarray
     std: np.ndarray
+    slot_mean: np.ndarray
+    slot_std: np.ndarray
+    slot_kind: str
+    clip_k: float
+
+
+def times_to_hour_index(ts: pd.Series) -> np.ndarray:
+    """Convert timestamps to hour-of-day indices [0..23]."""
+    try:
+        hours = pd.to_datetime(ts, errors='raise').dt.hour.to_numpy()
+    except Exception:
+        s = ts.astype(str)
+        hours = s.str.slice(11, 13).astype(int).to_numpy()
+    return hours.astype(np.int64)
 
 
 def masked_mean_std(x: np.ndarray, m: np.ndarray, eps: float = 1e-6) -> Tuple[np.ndarray, np.ndarray]:
@@ -120,6 +118,81 @@ def masked_mean_std(x: np.ndarray, m: np.ndarray, eps: float = 1e-6) -> Tuple[np
     var = (((x - mean) * m) ** 2).sum(axis=0) / count
     std = np.sqrt(np.maximum(var, eps))
     return mean.astype(np.float32), std.astype(np.float32)
+
+
+def masked_robust_slot_stats(
+    x: np.ndarray,
+    m: np.ndarray,
+    slots: np.ndarray,
+    *,
+    slot_count: int = 24,
+    eps: float = 1e-6,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Robust per-slot median and std via IQR on observed entries.
+
+    Returns (slot_median[S,H], slot_std[S,H]). Falls back to global robust stats if a slot lacks data.
+    """
+    if x.shape != m.shape:
+        raise ValueError('x and m must share shape [T,H]')
+    T, H = x.shape
+    if slots.shape[0] != T:
+        raise ValueError('slots must have length T')
+    X = x.astype(np.float64)
+    M = m.astype(np.float64)
+    X_obs = np.where(M > 0.5, X, np.nan)
+    S = int(slot_count)
+    med = np.zeros((S, H), dtype=np.float64)
+    q25 = np.zeros_like(med)
+    q75 = np.zeros_like(med)
+    for s in range(S):
+        idx = (slots == s)
+        if not np.any(idx):
+            med[s, :] = np.nan
+            q25[s, :] = np.nan
+            q75[s, :] = np.nan
+            continue
+        Xs = X_obs[idx]
+        med[s, :] = np.nanmedian(Xs, axis=0)
+        q25[s, :] = np.nanpercentile(Xs, 25.0, axis=0)
+        q75[s, :] = np.nanpercentile(Xs, 75.0, axis=0)
+    iqr = q75 - q25
+    robust_std = (iqr / 1.349)
+    # Global fallback
+    g_med = np.nanmedian(X_obs, axis=0)
+    g_q25 = np.nanpercentile(X_obs, 25.0, axis=0)
+    g_q75 = np.nanpercentile(X_obs, 75.0, axis=0)
+    g_std = (g_q75 - g_q25) / 1.349
+    std_floor = 1e-3
+    g_std = np.clip(g_std, std_floor, None)
+    med = np.where(np.isnan(med), g_med.reshape(1, H), med)
+    robust_std = np.where(np.isnan(robust_std), g_std.reshape(1, H), robust_std)
+    robust_std = np.clip(robust_std, std_floor, None)
+    return med.astype(np.float32), robust_std.astype(np.float32)
+
+
+def apply_standardization_slotwise(
+    x: np.ndarray,
+    m: np.ndarray,
+    slots: np.ndarray,
+    slot_mean: np.ndarray,
+    slot_std: np.ndarray,
+    *,
+    clip_k: float = 5.0,
+) -> np.ndarray:
+    """Apply per-slot robust z-score and gate by mask.
+
+    Shapes: x/m [T,H], slots [T], slot_mean/std [S,H].
+    """
+    if x.shape != m.shape:
+        raise ValueError('x and m must share shape [T,H]')
+    idx = slots.astype(np.int64)
+    mean_t = slot_mean[idx]
+    std_t = slot_std[idx]
+    x_scaled = (x - mean_t) / std_t
+    if clip_k is not None and clip_k > 0:
+        x_scaled = np.clip(x_scaled, -float(clip_k), float(clip_k))
+    x_proc = np.where(m > 0.5, x_scaled, 0.0).astype(np.float32)
+    return x_proc
 
 
 def _load_header(csv_path: str) -> List[str]:
@@ -162,7 +235,7 @@ def create_paired_loaders(
     seed: Optional[int] = 1337,
     num_workers: int = 0,
 ) -> DataModule:
-    Xa, Xn, M_struct, _ts = load_paired_timeseries(train_normal_csv, train_attacked_csv)
+    Xa, Xn, M_struct, ts = load_paired_timeseries(train_normal_csv, train_attacked_csv)
     T, H = Xa.shape
     train_T = int(T * train_ratio)
     val_T = int(T * val_ratio)
@@ -174,14 +247,19 @@ def create_paired_loaders(
     Xa_va, Xn_va, M_va = Xa[s_val], Xn[s_val], M_struct[s_val]
     Xa_te, Xn_te, M_te = Xa[s_test], Xn[s_test], M_struct[s_test]
 
-    # Standardization computed from training normal only
-    mean, std = masked_mean_std(Xn_tr, M_tr)
-    def _apply(x, m):
-        return _apply_standardization(x, m, mean, std)
-
-    Xa_tr_s, Xn_tr_s = _apply(Xa_tr, M_tr), _apply(Xn_tr, M_tr)
-    Xa_va_s, Xn_va_s = _apply(Xa_va, M_va), _apply(Xn_va, M_va)
-    Xa_te_s, Xn_te_s = _apply(Xa_te, M_te), _apply(Xn_te, M_te)
+    # Slot-wise robust standardization computed from training normal only (hour-of-day)
+    hours = times_to_hour_index(ts)
+    hours_tr = hours[s_train]
+    hours_va = hours[s_val]
+    hours_te = hours[s_test]
+    slot_mean, slot_std = masked_robust_slot_stats(Xn_tr, M_tr, hours_tr, slot_count=24)
+    CLIP_K = 5.0
+    Xa_tr_s = apply_standardization_slotwise(Xa_tr, M_tr, hours_tr, slot_mean, slot_std, clip_k=CLIP_K)
+    Xn_tr_s = apply_standardization_slotwise(Xn_tr, M_tr, hours_tr, slot_mean, slot_std, clip_k=CLIP_K)
+    Xa_va_s = apply_standardization_slotwise(Xa_va, M_va, hours_va, slot_mean, slot_std, clip_k=CLIP_K)
+    Xn_va_s = apply_standardization_slotwise(Xn_va, M_va, hours_va, slot_mean, slot_std, clip_k=CLIP_K)
+    Xa_te_s = apply_standardization_slotwise(Xa_te, M_te, hours_te, slot_mean, slot_std, clip_k=CLIP_K)
+    Xn_te_s = apply_standardization_slotwise(Xn_te, M_te, hours_te, slot_mean, slot_std, clip_k=CLIP_K)
 
     ds_train = PairedSlidingWindowDataset(Xa_tr_s, Xn_tr_s, M_tr.astype(np.float32), time_length, stride)
     ds_val = PairedSlidingWindowDataset(Xa_va_s, Xn_va_s, M_va.astype(np.float32), time_length, stride)
@@ -193,14 +271,29 @@ def create_paired_loaders(
     dl_train = DataLoader(ds_train, batch_size=batch_size, shuffle=True, num_workers=num_workers, worker_init_fn=wif_train)
     dl_val = DataLoader(ds_val, batch_size=batch_size, shuffle=False, num_workers=num_workers, worker_init_fn=wif_val)
     dl_test = DataLoader(ds_test, batch_size=batch_size, shuffle=False, num_workers=num_workers, worker_init_fn=wif_test)
-    return DataModule(train=dl_train, val=dl_val, test=dl_test, mean=mean, std=std)
+    # Legacy mean/std kept for compatibility; compute simple masked mean/std on training
+    mean_legacy, std_legacy = masked_mean_std(Xn_tr, M_tr)
+    return DataModule(
+        train=dl_train,
+        val=dl_val,
+        test=dl_test,
+        mean=mean_legacy,
+        std=std_legacy,
+        slot_mean=slot_mean,
+        slot_std=slot_std,
+        slot_kind='hour',
+        clip_k=CLIP_K,
+    )
+
 
 
 __all__ = [
     'load_timeseries',
     'load_paired_timeseries',
-    'SlidingWindowDataset',
     'PairedSlidingWindowDataset',
     'create_paired_loaders',
     'DataModule',
+    'times_to_hour_index',
+    'apply_standardization_slotwise',
+    'masked_robust_slot_stats',
 ]

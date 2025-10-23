@@ -76,8 +76,11 @@ class GaussianDecoder(nn.Module):
             mean = self.output_activation(mean_raw)
         else:
             mean = mean_raw
-        # logvar = log(softplus(raw) + eps)
+        # logvar = log(softplus(raw) + eps), then clamp to prevent variance blow-up
         logvar = torch.log(F.softplus(raw) + self.eps)
+        # Hard upper bound on log-variance: ~ log(10.0)
+        LOGVAR_MAX = 2.302585092994046
+        logvar = torch.clamp(logvar, max=LOGVAR_MAX)
         return mean, logvar
 
 

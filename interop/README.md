@@ -40,7 +40,7 @@ Windowed Reconstruction (Python CLI)
   - Configure `infer.normal_csv`, `infer.attacked_csv`, `infer.end_timestamp`, `infer.length` in `config.yaml`.
   - Run: `python scripts/infer_reconstruct.py`
 - Outputs under `output/<case>/infer/<exp_name>/`:
-  - `metrics.csv` with per-timestamp MSE/MAE/RMSE/MAPE/MSPE and a bottom mean row.
+  - `metrics.csv` with per-timestamp MSE/MAE/NRMSE/sMAPE (observed-only) and a final mean row; per-timestamp NRMSE uses fixed training slot-wise std as scale.
   - `reconstructed_window.csv`, `attacked_window.csv`, `normal_window.csv`.
 
 MATLAB Wrapper (optional)

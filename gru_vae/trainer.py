@@ -51,7 +51,7 @@ def _run_epoch(
         if train:
             assert optimizer is not None
             optimizer.zero_grad(set_to_none=True)
-            out = model.elbo_sequence_supervised(x_input, m, x_target, supervise='obs', beta=beta)
+            out = model.elbo_sequence_supervised(x_input, m, x_target, beta=beta)
             loss = out['loss']
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -64,7 +64,7 @@ def _run_epoch(
                 total_mse_obs += metrics['mse_obs'].mean().to(dtype=total_loss.dtype)
                 num_batches += 1
         else:
-            out = model.elbo_sequence_supervised(x_input, m, x_target, supervise='obs', beta=beta)
+            out = model.elbo_sequence_supervised(x_input, m, x_target, beta=beta)
             metrics = batch_metrics(out['mean'], out['logvar_x'], x_target, m)
             total_loss += out['loss'].detach().to(dtype=total_loss.dtype)
             total_nll += out['nll'].detach().to(dtype=total_loss.dtype)

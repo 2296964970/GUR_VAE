@@ -32,7 +32,7 @@ End-to-end GRU-Variational Autoencoder (GRU-VAE) for power-system measurement st
 
 Data locations (paired and aligned)
 - Training (2025/07–08): under `input/{case}/train/`
-  - Paired CSVs with identical timestamps: `*_2025-07_2025-08_clean_noisy.csv` (normal) and `*_fdia_2025-07_2025-08_noisy.csv` (attacked).
+  - Paired CSVs with identical headers and timestamps: `*_2025-07_2025-08_clean_noisy.csv` (normal) and `*_fdia_2025-07_2025-08_noisy.csv` (attacked).
 - Inference (2025/09): under `input/{case}/infer/`
   - Paired CSVs: `*_2025-09_clean_noisy.csv` (normal) and `*_fdia_2025-09_noisy.csv` (attacked).
 
@@ -43,11 +43,12 @@ Data locations (paired and aligned)
 - Training normal CSV must not contain `fdia` nor `2025-09`.
 - Training attacked CSV may contain `fdia` but must not contain `2025-09`.
 - Any `2025-09` path is forbidden in training configuration.
-- Standardization stats (`mean.npy`, `std.npy`) are computed from the training normal split only and saved next to the checkpoint.
+- Standardization uses slot-wise robust (hour-of-day) statistics computed from the training normal split only and saved next to the checkpoint; these statistics are reused for inference (no re-fitting on 2025/09).
 
-Observed-only reconstruction loss
+Observed-only reconstruction and masks
 - The model consumes attacked inputs and computes NLL against the aligned normal targets.
-- Only observed positions (mask == 1) contribute to loss/metrics.
+- Only observed positions (mask == 1) contribute to loss/metrics; missing entries are not penalized.
+- The observability mask is derived from `NaN` positions and is enforced identical across paired CSVs. Encoder inputs are mask-aware via concatenation: `[x*mask, mask]`.
 
 ---
 
@@ -60,7 +61,7 @@ All parameters are configured in a single `config.yaml` at the project root. The
   - `global.case`, `global.data_dir`
   - `train.normal_csv`, `train.attacked_csv` (07–08)
   - `infer.normal_csv`, `infer.attacked_csv` (09)
-  - `infer.end_timestamp` (inclusive end of window), `infer.length`
+  - `infer.end_timestamp` (inclusive end of window), `infer.length`, `infer.mc_samples`
   - `model`, `train`, `window`
 
 2) Train
@@ -69,7 +70,7 @@ python scripts/train.py
 ```
 Artifacts go to `output/<case>/models/<exp_name>/`:
 - `ckpt.pt` (with minimal hyperparameters)
-- `mean.npy`, `std.npy` (training-normal statistics)
+- `slot_stats.npz` (slot-wise robust standardization stats for hour-of-day)
 - `training_curve.tsv` (two lines: train loss, val loss sequences)
 
 3) Inference (Reconstruction)
@@ -77,7 +78,7 @@ Artifacts go to `output/<case>/models/<exp_name>/`:
 python scripts/infer_reconstruct.py
 ```
 Outputs are written under `output/<case>/infer/<exp_name>/`:
-- `metrics.csv` (per-timestamp MSE/MAE/RMSE/MAPE/MSPE on observed positions, plus a final mean row)
+- `metrics.csv` (per-timestamp MSE/MAE/NRMSE/sMAPE on observed positions with a final mean row; NRMSE uses fixed training slot-wise std as scale)
 - `reconstructed_window.csv` (model reconstruction on original scale)
 - `attacked_window.csv` (attacked slice for the same window)
 - `normal_window.csv` (normal slice for the same window)
@@ -88,7 +89,8 @@ Outputs are written under `output/<case>/infer/<exp_name>/`:
 - Encoder: causal GRU produces per-step diagonal Gaussian `q(z_t|x_<=t)`.
 - Prior: AR(1) state-space model with optional low-rank noise.
 - Decoder: MLP outputs per-step Gaussian mean and log-variance.
-- Training objective: observed-only Gaussian NLL + β·KL (with warm-up).
+- Training objective: observed-only Gaussian NLL + KL regularization (with warm-up).
+  - KL warm-up: linear 0 → `beta` during the first ~20% of epochs; always enabled (no configuration switch).
 
 ---
 
@@ -104,6 +106,19 @@ Outputs are written under `output/<case>/infer/<exp_name>/`:
 
 ---
 
+## Inference Specifics (Current Implementation)
+- Warm-up context: inference runs on an extended window that includes up to one window-length of historical context before the requested target window to reduce cold-start bias; metrics are computed on the target window only.
+- Monte Carlo averaging: inference draws `infer.mc_samples` samples from the posterior over latent states and averages decoder means to approximate the posterior predictive mean (default 8); no observation-noise sampling is used.
+- No passthrough of observed inputs: reconstructed values are always model predictions at all positions (observed entries are not copied through).
+- Standardization: uses slot-wise robust (hour-of-day) statistics computed from 2025/07–08 normal training split; no re-fitting on 2025/09.
+- Metrics: per-timestamp MSE/MAE/sMAPE/NRMSE on observed positions only; NRMSE per-timestamp uses fixed training slot-wise std as scale. The script prints Top-10 timestamps by improvement (att - rep) for each metric, and also prints a window-level NRMSE summary.
+
+## Configuration Notes
+- `infer.mc_samples` (int): number of MC samples for inference averaging (default: 8).
+- Encoder inputs are mask-aware via concatenation `[x*mask, mask]`; the mask derives from `NaN` positions and is enforced identical across paired CSVs.
+- Decoder predicts time-varying mean and log-variance; a hard upper bound on log-variance prevents variance blow-up.
+
+---
+
 ## License
 Research use within the GRU-VAE FDIA defense project. See forthcoming license documentation for details.
-

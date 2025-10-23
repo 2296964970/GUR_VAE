@@ -20,6 +20,7 @@ infer:
   attacked_csv: input/case14/infer/case14_fdia_2025-09_noisy.csv
   end_timestamp: "2025/09/08 17:00"   # the inclusive end time of the repair window
   length: 96                           # number of steps in the window
+  mc_samples: 8                        # Monte Carlo samples for inference averaging
 
 # Windowing and batching
 window:
@@ -31,7 +32,7 @@ window:
 
 # Model hyperparameters
 model:
-  latent_dim: 32
+  latent_dim: 64
   dec_hidden: "256,256"  # comma-separated or a YAML list, e.g., [256, 256]
   gru_hidden: 256
   gru_layers: 1
