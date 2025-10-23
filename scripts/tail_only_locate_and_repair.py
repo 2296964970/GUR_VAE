@@ -15,8 +15,6 @@ Sliding behavior:
 """
 
 from __future__ import annotations
-
-import argparse
 import math
 import os
 from typing import Dict, List, Tuple
@@ -30,6 +28,7 @@ from gru_vae.data import load_timeseries, SlidingWindowDataset, masked_mean_std,
 from gru_vae.model import OnlineGPVAE
 from gru_vae.noise import apply_noise
 from gru_vae.utils import parse_sizes, resolve_device
+from gru_vae.config import load_config
 
 def _ensure_outdir_case(case: str, kind: str) -> str:
     base = os.path.join('output', case, kind)
@@ -298,65 +297,15 @@ def _select_tail_timestamp_only(*, attack_timestamp: str, timestamps: pd.Series,
 
 
 def main() -> None:
-    p = argparse.ArgumentParser()
-    p.add_argument('--data_dir', type=str, default='input')
-    p.add_argument('--case', type=str, default='case14')
-    p.add_argument('--normal_csv', type=str, default='')
-    p.add_argument('--attacked_csv', type=str, default='')
-    p.add_argument('--time_length', type=int, default=96)
-    p.add_argument('--sliding_steps', type=int, default=12, help='Number of consecutive tail steps to repair (>=1)')
-    # Timestamp-only selection
-    p.add_argument('--attack_timestamp', type=str, required=True, help='Exact time; if invalid, fallback to first feasible attacked tail at/after this time')
-    # Thresholds
-    p.add_argument('--alpha', type=float, default=0.02)
-    p.add_argument('--min_count_per_feature', type=int, default=100)
-    # Threshold mode: keep only global per-feature quantile thresholds
-    # Diagnostics
-    p.add_argument('--print_topk', dest='print_topk', action='store_true', help='Print top-K tail scores per step')
-    p.add_argument('--no-print_topk', dest='print_topk', action='store_false')
-    p.set_defaults(print_topk=False)
-    p.add_argument('--topk', type=int, default=20, help='Top-K features by tail score to display when --print_topk is set')
-    # Tail-scores wide-format options (output path is fixed under output/<case>/tail_scores)
-    p.add_argument('--tail_scores_wide', dest='tail_scores_wide', action='store_true',
-                   help='Also emit a wide CSV where each row is a timestamp and each column is a feature')
-    p.add_argument('--no-tail_scores_wide', dest='tail_scores_wide', action='store_false')
-    p.set_defaults(tail_scores_wide=False)
-    p.add_argument('--tail_scores_value', type=str, default='score',
-                   choices=['score', 'threshold', 'keep_pred', 'is_anom'],
-                   help='Which value to emit in wide tail-scores: raw score, per-feature threshold, keep_pred (1/0), or is_anom (1/0)')
-    p.add_argument('--print_drop_metrics', dest='print_drop_metrics', action='store_true', help='Print drop-only metrics in summary')
-    p.add_argument('--no-print_drop_metrics', dest='print_drop_metrics', action='store_false')
-    p.set_defaults(print_drop_metrics=True)
-    # Verbose control
-    p.add_argument('--verbose', dest='quiet', action='store_false', help='Verbose mode: show detailed progress')
-    p.add_argument('--no-verbose', dest='quiet', action='store_true')
-    p.set_defaults(quiet=True)
-    # Output naming
-    p.add_argument('--out_suffix', type=str, default='', help='Optional suffix to append to output CSV filenames')
-    # Model
-    p.add_argument('--latent_dim', type=int, default=32)
-    p.add_argument('--dec_hidden', type=str, default='256,256')
-    p.add_argument('--gru_hidden', type=int, default=256)
-    p.add_argument('--gru_layers', type=int, default=1)
-    p.add_argument('--beta', type=float, default=0.1)
-    p.add_argument('--obs_init_logvar', type=float, default=-3.5)
-    p.add_argument('--ckpt', type=str, default='')
-    p.add_argument('--batch_size', type=int, default=64)
-    # Inference-time noise (align with training corruption on masked positions)
-    # Inference-time noise uses decoder-variance-adaptive sigma at tail (no fixed mode kept)
-    p.add_argument('--noise_seed', type=int, default=-1, help='If >=0, use deterministic noise with seed+tail_idx')
-    p.add_argument('--train_ratio', type=float, default=0.7)
-    p.add_argument('--device', type=str, default='cpu', choices=['cpu', 'cuda'])
-    # Stats source: use training normal set (recommended) to match training standardization, or fallback to current normal
-    p.add_argument('--stats_source', type=str, default='training', choices=['training', 'normal'],
-                   help='Use mean/std from auto-detected training normal set (clean 2025/07-08) or from the provided normal_csv')
-    
-    args = p.parse_args()
+    # All parameters now come from config.yaml
+    args = load_config()
 
     if args.time_length <= 0:
         raise SystemExit('[error] --time_length must be positive')
     if args.sliding_steps <= 0:
         raise SystemExit('[error] --sliding_steps must be positive')
+    if not args.attack_timestamp or not str(args.attack_timestamp).strip():
+        raise SystemExit('[error] attack_timestamp must be set in config for tail-only inference')
 
     device = resolve_device(args.device)
 

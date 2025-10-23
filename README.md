@@ -54,34 +54,41 @@ Data locations (do not rely on exact filenames)
 
 ---
 
-## Quickstart
-1) Train
-```
-python scripts/train.py \
-  --data_dir input --case case14 \
-  --epochs 40 --batch_size 64 --device cpu
-```
-Checkpoint is saved to `output/<case>/models/<exp_name>/ckpt.pt`.
+## Quickstart (Single Config)
 
-2) Tail-only Locate + Repair
+All parameters are configured in a single `config.yaml` at the repo root. No command‑line flags are required or supported by the scripts anymore.
+
+1) Configure
+- Open `config.yaml` and adjust:
+  - `global.case`, `global.data_dir`
+  - `data.*` paths (or leave blank to auto-detect where supported)
+  - `model`, `train`, `window`, `mask`, `noise`
+  - `inference_tail.attack_timestamp` for the target attacked time
+
+2) Train
 ```
-python scripts/tail_only_locate_and_repair.py \
-  --data_dir input --case case14 \
-  --time_length 24 --sliding_steps 6 \
-  --attack_timestamp "2025/09/14 12:00" \
-  --ckpt output/case14/models/gru_base_ep40/ckpt.pt \
-  --tail_scores_wide
+python scripts/train.py
+```
+Artifacts go to `output/<case>/models/<exp_name>/`.
+
+3) Tail-only Locate + Repair
+```
+python scripts/tail_only_locate_and_repair.py
 ```
 Notes
-- If `--normal_csv` and `--attacked_csv` are omitted, the script searches under `input/<case>/infer/` for a non‑`fdia` 2025/09 file (clean) and an `fdia` 2025/09 file (attacked).
+- If `data.normal_csv` or `data.attacked_csv` is empty, the script searches under `input/<case>/infer/` for a clean 2025/09 file (non‑`fdia`) and an attacked 2025/09 file (`fdia`).
 Outputs are written under `output/<case>/...`:
 - `output/<case>/repaired/` — repaired tail rows CSV, and optional wide-format repaired/attack/true rows.
-- `output/<case>/tail_scores/` — wide-format tail scores per step when `--tail_scores_wide` is enabled.
+- `output/<case>/tail_scores/` — wide-format tail scores per step when enabled.
 
 ---
 
 ## Interop with MATLAB (optional)
-See `interop/README.md` for exporting CSVs from MATLAB and calling the Python CLI via `run_tail_repair.m`.
+Set `matlab_eval.*` fields in `config.yaml` and run:
+```
+python scripts/run_state_estimation_triplet.py
+```
+See `interop/README.md` for repository-specific MATLAB details.
 
 ---
 

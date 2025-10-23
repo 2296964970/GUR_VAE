@@ -1,35 +1,25 @@
-import argparse
 import os
 import subprocess
 import sys
 from pathlib import Path
+from gru_vae.config import load_config
 
 
 def to_matlab_path(p: str) -> str:
     return str(Path(p).resolve()).replace('\\', '/')
 
 def main() -> None:
-    p = argparse.ArgumentParser(description='Run MATLAB WLS state estimation from triplet wide CSVs (attacked/repaired/clean).')
-    p.add_argument('--matlab_root', type=str, required=True, help='Path to MATLAB repo root (loadseries)')
-    p.add_argument('--matlab_bin', type=str, default='matlab', help='MATLAB executable (e.g., matlab, "C:/Program Files/MATLAB/R2022b/bin/matlab.exe")')
-    p.add_argument('--case', type=str, default='case14')
-    p.add_argument('--attacked_csv', type=str, required=True, help='Path to tail_attacked_wide.csv')
-    p.add_argument('--repaired_csv', type=str, required=True, help='Path to tail_repaired_wide.csv')
-    p.add_argument('--clean_csv', type=str, required=True, help='Path to tail_true_wide.csv (clean baseline)')
-    p.add_argument('--out_dir', type=str, default='', help='Directory to write SE figures/metrics (default: output/<case>/se_eval)')
-    p.add_argument('--format', type=str, default='pdf', choices=['pdf', 'eps'])
-    p.add_argument('--angle_unit', type=str, default='rad', choices=['rad', 'deg'])
-    p.add_argument('--reference_mode', type=str, default='eliminate', choices=['eliminate', 'pseudo', 'none'])
-    args = p.parse_args()
+    # All parameters now come from config.yaml
+    args = load_config()
 
     # Validate inputs
-    for k in ('matlab_root', 'attacked_csv', 'repaired_csv', 'clean_csv'):
+    for k in ('matlab_root', 'se_attacked_csv', 'se_repaired_csv', 'se_clean_csv'):
         v = getattr(args, k)
         if not os.path.exists(v):
             print(f'[error] Missing path for --{k}: {v}', file=sys.stderr)
             sys.exit(2)
 
-    out_dir = args.out_dir or os.path.join('output', args.case, 'se_eval')
+    out_dir = args.se_out_dir or os.path.join('output', args.case, 'se_eval')
     os.makedirs(out_dir, exist_ok=True)
     tmp_dir = os.path.join('runs', 'matlab_tmp')
     os.makedirs(tmp_dir, exist_ok=True)
@@ -39,9 +29,9 @@ def main() -> None:
     code_lines = []
     code_lines.append(f"addpath(genpath('{to_matlab_path(args.matlab_root)}')); try, init; catch, end")
     code_lines.append(f"case_name = '{args.case}';")
-    code_lines.append(f"attacked_csv = '{to_matlab_path(args.attacked_csv)}';")
-    code_lines.append(f"repaired_csv = '{to_matlab_path(args.repaired_csv)}';")
-    code_lines.append(f"clean_csv    = '{to_matlab_path(args.clean_csv)}';")
+    code_lines.append(f"attacked_csv = '{to_matlab_path(args.se_attacked_csv)}';")
+    code_lines.append(f"repaired_csv = '{to_matlab_path(args.se_repaired_csv)}';")
+    code_lines.append(f"clean_csv    = '{to_matlab_path(args.se_clean_csv)}';")
     code_lines.append(f"out_dir      = '{to_matlab_path(out_dir)}';")
     code_lines.append(f"fmt          = '{args.format}';")
     code_lines.append(f"angle_unit   = '{args.angle_unit}';")

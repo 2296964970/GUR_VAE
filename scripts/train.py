@@ -1,4 +1,3 @@
-import argparse
 import os
 import random
 
@@ -9,6 +8,7 @@ from gru_vae.data import create_normal_loaders
 from gru_vae.trainer import OnlineTrainer
 from gru_vae.utils import parse_sizes, resolve_device, first_batch_or_exit
 from gru_vae.model import OnlineGPVAE
+from gru_vae.config import load_config
 
 
 def set_seed(seed: int) -> None:
@@ -19,51 +19,8 @@ def set_seed(seed: int) -> None:
 
 
 def main() -> None:
-    p = argparse.ArgumentParser()
-    # Data
-    p.add_argument('--data_dir', type=str, default='input')
-    p.add_argument('--case', type=str, default='case14')
-    p.add_argument('--train_csv', type=str, default=None, help='Path to training CSV (default: auto-detect clean 2025/07-08 under {data_dir}/{case})')
-    p.add_argument('--time_length', type=int, default=96)
-    p.add_argument('--stride', type=int, default=48)
-    p.add_argument('--batch_size', type=int, default=64)
-    p.add_argument('--mask_rate', type=float, default=0.3)
-    p.add_argument('--mask_mode', type=str, default='block', choices=['iid', 'block', 'corr', 'point', 'window'])
-    # Block mask params
-    p.add_argument('--block_t_min', type=int, default=2)
-    p.add_argument('--block_t_max', type=int, default=8)
-    p.add_argument('--block_f_min', type=int, default=4)
-    p.add_argument('--block_f_max', type=int, default=32)
-    p.add_argument('--block_max_blocks', type=int, default=4)
-    # Correlated mask params
-    p.add_argument('--corr_t', type=int, default=7)
-    p.add_argument('--corr_f', type=int, default=15)
-    # Input noise corruption (always applied on selected masked positions)
-    p.add_argument('--noise_kind', type=str, default='gaussian', choices=['gaussian', 'bias', 'scale', 'spike'])
-    p.add_argument('--noise_sigma', type=float, default=1.0)
-    p.add_argument('--noise_bias_min', type=float, default=-1.0)
-    p.add_argument('--noise_bias_max', type=float, default=1.0)
-    p.add_argument('--noise_scale_min', type=float, default=0.5)
-    p.add_argument('--noise_scale_max', type=float, default=1.5)
-    p.add_argument('--noise_amp_min', type=float, default=3.0)
-    p.add_argument('--noise_amp_max', type=float, default=6.0)
-    p.add_argument('--mask_seed', type=int, default=1337)
-    # Model (GRU-only)
-    p.add_argument('--latent_dim', type=int, default=32)
-    p.add_argument('--dec_hidden', type=str, default='256,256')
-    p.add_argument('--gru_hidden', type=int, default=256)
-    p.add_argument('--gru_layers', type=int, default=1)
-    p.add_argument('--beta', type=float, default=0.1)
-    p.add_argument('--obs_init_logvar', type=float, default=-3.5)
-    p.add_argument('--grad_clip', type=float, default=1e4)
-    p.add_argument('--learning_rate', type=float, default=3e-4)
-    # Training uses decoder-variance-adaptive noise at masked positions (no fixed-sigma mode kept)
-    # Train
-    p.add_argument('--epochs', type=int, default=40)
-    p.add_argument('--seed', type=int, default=1337)
-    p.add_argument('--exp_name', type=str, default='gru_base_ep40')
-    p.add_argument('--device', type=str, default='cpu', choices=['cpu', 'cuda'])
-    args = p.parse_args()
+    # All parameters now come from config.yaml
+    args = load_config()
 
     set_seed(args.seed)
 
@@ -71,7 +28,7 @@ def main() -> None:
     loaders = create_normal_loaders(
         data_dir=args.data_dir,
         case=args.case,
-        train_csv=args.train_csv,
+        train_csv=(args.train_csv or None),
         time_length=args.time_length,
         stride=args.stride,
         batch_size=args.batch_size,

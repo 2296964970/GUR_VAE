@@ -1,0 +1,92 @@
+# Global dataset selection
+global:
+  data_dir: input
+  case: case14
+
+# Data paths (leave empty to auto-detect where supported)
+data:
+  train_csv: ""  # clean 2025/07-08 for training; if empty, auto-detect under input/{case}
+  normal_csv: input/case14/case14_acopf_2025-09_noisy.csv
+  attacked_csv: input/case14/case14_fdia_2025-09_noisy.csv
+
+# Windowing and batching
+window:
+  time_length: 96
+  stride: 48
+  batch_size: 64
+  train_ratio: 0.7
+  val_ratio: 0.15
+
+# Self-supervised masking during training
+mask:
+  mask_rate: 0.3
+  mask_mode: block   # iid | block | corr  (aliases: point->iid, window->block)
+  block_t_min: 2
+  block_t_max: 8
+  block_f_min: 4
+  block_f_max: 32
+  block_max_blocks: 4
+  corr_t: 7
+  corr_f: 15
+
+# Noise corruption on masked inputs
+noise:
+  kind: gaussian      # gaussian | bias | scale | spike
+  sigma: 1.0
+  bias_min: -1.0
+  bias_max: 1.0
+  scale_min: 0.5
+  scale_max: 1.5
+  amp_min: 3.0
+  amp_max: 6.0
+  mask_seed: 1337
+
+# Model hyperparameters
+model:
+  latent_dim: 32
+  dec_hidden: "256,256"  # comma-separated or a YAML list, e.g., [256, 256]
+  gru_hidden: 256
+  gru_layers: 1
+  beta: 0.1
+  obs_init_logvar: -3.5
+
+# Training configuration
+train:
+  epochs: 40
+  seed: 1337
+  learning_rate: 0.0003
+  grad_clip: 10000.0
+  exp_name: gru_base_ep40
+  device: cpu         # cpu | cuda
+
+# Tail-only locate+repair (inference)
+inference_tail:
+  sliding_steps: 12
+  attack_timestamp: "2025/09/01 00:00"   # exact timestamp contained in attacked CSV
+  alpha: 0.02
+  min_count_per_feature: 100
+  print_topk: false
+  topk: 20
+  tail_scores_wide: false
+  tail_scores_value: score   # score | threshold | keep_pred | is_anom
+  print_drop_metrics: true
+  quiet: true
+  out_suffix: ""
+  ckpt: output/case14/models/gru_base_ep40/ckpt.pt
+  batch_size: 64
+  noise_seed: -1
+  stats_source: training   # training | normal
+  device: cpu
+
+# Optional MATLAB state-estimation evaluation on wide CSV triplets
+matlab_eval:
+  matlab_root: ""     # set to your MATLAB repo root (with loadseries)
+  matlab_bin: matlab
+  attacked_csv: output/case14/repaired/tail_attacked_wide.csv
+  repaired_csv: output/case14/repaired/tail_repaired_wide.csv
+  clean_csv:    output/case14/repaired/tail_true_wide.csv
+  out_dir: ""        # default: output/{case}/se_eval
+  format: pdf        # pdf | eps
+  angle_unit: rad    # rad | deg
+  reference_mode: eliminate   # eliminate | pseudo | none
+
