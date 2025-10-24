@@ -6,7 +6,7 @@ End-to-end GRU-Variational Autoencoder (GRU-VAE) for power-system measurement st
 
 ## Repository Layout
 - `gru_vae/` Core library (data loaders, model, trainer, metrics, config).
-- `scripts/train.py` Train on paired attacked/normal windows with observed-only NLL + KL.
+- `scripts/train.py` Train on normal-only windows with FDIA noise injection (per-step sparse attacks) and observed-only NLL + KL.
 - `scripts/infer_reconstruct.py` Reconstruct attacked sequences over a specified window and report observed-space metrics.
 - `input/` Example datasets and structure description.
 - `output/` All generated artifacts.
@@ -30,19 +30,17 @@ End-to-end GRU-Variational Autoencoder (GRU-VAE) for power-system measurement st
   - IEEE 118-bus: 1202 features
 - Row count: 17,857 rows per file (1 header + 17,856 time steps).
 
-Data locations (paired and aligned)
+- Data locations
 - Training (2025/07–08): under `input/{case}/train/`
-  - Paired CSVs with identical headers and timestamps: `*_2025-07_2025-08_clean_noisy.csv` (normal) and `*_fdia_2025-07_2025-08_noisy.csv` (attacked).
+  - Normal CSV: `*_2025-07_2025-08_clean_noisy.csv` (used to fit and train with FDIA injection on-the-fly).
 - Inference (2025/09): under `input/{case}/infer/`
   - Paired CSVs: `*_2025-09_clean_noisy.csv` (normal) and `*_fdia_2025-09_noisy.csv` (attacked).
 
 ---
 
 ## Training and Inference Policy (No Data Leakage)
-- Training uses 2025/07–08 only with paired attacked/normal CSVs.
-- Training normal CSV must not contain `fdia` nor `2025-09`.
-- Training attacked CSV may contain `fdia` but must not contain `2025-09`.
-- Any `2025-09` path is forbidden in training configuration.
+- Training uses 2025/07–08 normal CSV only; FDIA attacks are simulated by per-step sparse Gaussian injection in standardized domain.
+- Training normal CSV must not contain `fdia` nor `2025-09`. Any `2025-09` path is forbidden in training configuration.
 - Standardization uses slot-wise robust (hour-of-day) statistics computed from the training normal split only and saved next to the checkpoint; these statistics are reused for inference (no re-fitting on 2025/09).
 
 Observed-only reconstruction and masks
@@ -52,16 +50,43 @@ Observed-only reconstruction and masks
 
 ---
 
+## FDIA Injection (Training)
+
+During training and validation, False Data Injection Attacks (FDIA) are simulated on-the-fly in the standardized domain.
+
+- Notation: `x_target ∈ R^{B×T×H}` (standardized clean inputs), `m ∈ {0,1}^{B×T×H}` (observability mask).
+- Per-step sparse attacks: for each batch `b` and time step `t`, pick a sparse subset of observed features to attack.
+- Attack rate: fixed fraction `q = 0.15` (no config switch). If no observed feature is selected, force-select `ceil(q · N_obs)` (or 1 if `N_obs > 0`). If `N_obs=0`, fall back to full domain (will be masked out by `m`).
+- Noise: i.i.d. Gaussian `ε ~ N(0, σ^2)` with `σ = noise.strength`.
+
+Formula (elementwise Hadamard products):
+
+```
+Given x_target, m, strength σ, rate q, for each (b, t):
+  obs_idx = { j | m[b,t,j] = 1 }
+  A[b,t,:] = 0
+  Sample S ⊆ obs_idx by Bernoulli(q); if S = ∅ and |obs_idx|>0, pick k=ceil(q·|obs_idx|) random indices; set A[b,t,S]=1
+  Sample ε[b,t,:] ~ Normal(0, σ^2 I)
+  x_input[b,t,:] = x_target[b,t,:] + ε[b,t,:] ⊙ A[b,t,:] ⊙ m[b,t,:]
+```
+
+- The model receives `x_input` and is optimized to reconstruct `x_target` using observed-only Gaussian NLL + KL.
+- Training and validation both use the same injection scheme (with `noise.seed` for reproducibility).
+
+Inference is unchanged: paired (attacked/normal) data from 2025/09 are used for evaluation only.
+
+---
+
 ## Quickstart (Single Config)
 
-All parameters are configured in a single `config.yaml` at the project root. The loader enforces schema/timestamp alignment between normal and attacked CSVs.
+All parameters are configured in a single `config.yaml` at the project root.
 
 1) Configure
 - Edit `config.yaml` and set:
   - `global.case`, `global.data_dir`
-  - `train.normal_csv`, `train.attacked_csv` (07–08)
+  - `train.normal_csv` (07–08)
+  - `noise.strength`, `noise.seed` (training-time FDIA injection)
   - `infer.normal_csv`, `infer.attacked_csv` (09)
-  - `infer.end_timestamp` (inclusive end of window), `infer.length`, `infer.mc_samples`
   - `model`, `train`, `window`
 
 2) Train
@@ -78,10 +103,7 @@ Artifacts go to `output/<case>/models/<exp_name>/`:
 python scripts/infer_reconstruct.py
 ```
 Outputs are written under `output/<case>/infer/<exp_name>/`:
-- `metrics.csv` (per-timestamp MSE/MAE/NRMSE/sMAPE on observed positions with a final mean row; NRMSE uses fixed training slot-wise std as scale)
-- `reconstructed_window.csv` (model reconstruction on original scale)
-- `attacked_window.csv` (attacked slice for the same window)
-- `normal_window.csv` (normal slice for the same window)
+- `reconstructed.csv` (full-series reconstruction on original scale)
 
 ---
 
@@ -107,11 +129,11 @@ Outputs are written under `output/<case>/infer/<exp_name>/`:
 ---
 
 ## Inference Specifics (Current Implementation)
-- Warm-up context: inference runs on an extended window that includes up to one window-length of historical context before the requested target window to reduce cold-start bias; metrics are computed on the target window only.
-- Monte Carlo averaging: inference draws `infer.mc_samples` samples from the posterior over latent states and averages decoder means to approximate the posterior predictive mean (default 8); no observation-noise sampling is used.
-- No passthrough of observed inputs: reconstructed values are always model predictions at all positions (observed entries are not copied through).
+- Full-series reconstruction: the script standardizes the entire 2025/09 attacked series, runs causal reconstruction, and unstandardizes to original scale.
+- No window/MC: window selection and MC averaging are removed to keep the pipeline minimal.
+- No passthrough of observed inputs: reconstructed values are model predictions at all positions.
 - Standardization: uses slot-wise robust (hour-of-day) statistics computed from 2025/07–08 normal training split; no re-fitting on 2025/09.
-- Metrics: per-timestamp MSE/MAE/sMAPE/NRMSE on observed positions only; NRMSE per-timestamp uses fixed training slot-wise std as scale. The script prints Top-10 timestamps by improvement (att - rep) for each metric, and also prints a window-level NRMSE summary.
+- Terminal summary: prints Top-10 and Worst-10 timestamps by MSE repair effect (att - rep) on observed positions only.
 
 ## Configuration Notes
 - `infer.mc_samples` (int): number of MC samples for inference averaging (default: 8).

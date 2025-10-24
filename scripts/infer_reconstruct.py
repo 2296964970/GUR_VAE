@@ -1,36 +1,17 @@
 import os
-from typing import Tuple
-
 import numpy as np
 import pandas as pd
 import torch
 
 from gru_vae.config import load_config
-from gru_vae.data import load_paired_timeseries, apply_standardization_slotwise, times_to_hour_index
+from gru_vae.data import (
+    load_paired_timeseries,
+    apply_standardization_slotwise,
+    times_to_hour_index,
+    masked_robust_slot_stats,
+)
 from gru_vae.model import OnlineGPVAE
 from gru_vae.utils import resolve_device
-
-
-def _normalized_rmse_window(y_true: np.ndarray, y_pred: np.ndarray, mask: np.ndarray, scale: np.ndarray) -> float:
-    """Compute window-level NRMSE on observed positions using fixed scale.
-
-    Shapes: y_true/y_pred/mask/scale: [L, H]
-    - mask: 1 for observed, 0 for missing (only observed contribute)
-    - scale: per-time, per-feature normalization scale, typically slot_std[hour]
-    Returns a single scalar NRMSE = sqrt(mean(((y_pred - y_true)/scale)^2 over observed positions)).
-    """
-    if not (y_true.shape == y_pred.shape == mask.shape == scale.shape):
-        raise ValueError('y_true, y_pred, mask, scale must share shape [L,H]')
-    obs = (mask > 0.5).astype(np.float64)
-    # Guard against zero/inf scale
-    scale_s = np.clip(scale.astype(np.float64), 1e-6, None)
-    err = (y_pred.astype(np.float64) - y_true.astype(np.float64)) / scale_s
-    se = (err * err) * obs
-    num = float(se.sum())
-    den = float(obs.sum())
-    if den <= 0:
-        return float('nan')
-    return float(np.sqrt(num / den))
 
 
 def main() -> None:
@@ -51,34 +32,8 @@ def main() -> None:
     # Optional metadata
     clip_k = float(stats['clip_k']) if 'clip_k' in stats else 5.0
 
-    # Data: infer paired
+    # Data: infer paired (full series)
     Xa, Xn, M, ts = load_paired_timeseries(args.infer_normal_csv, args.infer_attacked_csv)
-
-    # Slice window by end timestamp and length
-    end_ts = str(args.infer_end_timestamp or '').strip()
-    L = int(args.infer_length)
-    if not end_ts:
-        raise SystemExit('[error] infer.end_timestamp must be provided in config.yaml')
-    if L <= 0:
-        raise SystemExit('[error] infer.length must be positive')
-    # Find end index
-    try:
-        idx_end = int(np.where(ts.astype(str).values == end_ts)[0][0])
-    except Exception:
-        raise SystemExit(f"[error] end timestamp not found in series: {end_ts}")
-    idx_start = idx_end - L + 1
-    if idx_start < 0:
-        raise SystemExit(f"[error] Window start < 0. Need length {L} ending at {end_ts}")
-    Xa_w = Xa[idx_start:idx_end+1]
-    Xn_w = Xn[idx_start:idx_end+1]
-    M_w = M[idx_start:idx_end+1]
-    ts_w = ts.iloc[idx_start:idx_end+1].reset_index(drop=True)
-
-    # Warm-up context: run the model on preceding context (up to one window length)
-    warmup_len = int(min(idx_start, L))
-    s_warm = idx_start - warmup_len
-    Xa_ext = Xa[s_warm:idx_end+1]
-    M_ext = M[s_warm:idx_end+1]
 
     # Model
     # Infer H from data
@@ -110,164 +65,163 @@ def main() -> None:
     model.load_state_dict(state)
     model.eval()
 
-    # Standardize only the extended context and run inference (batch=1)
-    hours_ext = times_to_hour_index(ts.iloc[s_warm:idx_end+1].reset_index(drop=True))
-    Xa_ext_s = apply_standardization_slotwise(Xa_ext, M_ext, hours_ext, slot_mean, slot_std, clip_k=clip_k)
-    x_in = torch.from_numpy(Xa_ext_s).unsqueeze(0).to(device)
-    m_in = torch.from_numpy(M_ext).unsqueeze(0).to(device)
-    # Monte Carlo averaging over posterior z (default enabled, no switch)
+    # Standardize full series and run reconstruction (batch=1)
+    hours_all = times_to_hour_index(ts)
+    Xa_s = apply_standardization_slotwise(Xa, M, hours_all, slot_mean, slot_std, clip_k=clip_k)
+    x_in = torch.from_numpy(Xa_s).unsqueeze(0).to(device)
+    m_in = torch.from_numpy(M).unsqueeze(0).to(device)
     with torch.no_grad():
-        B = int(x_in.shape[0])
-        # MC samples from config (infer.mc_samples), default 8, clamp >=1
-        K = max(1, int(getattr(args, 'infer_mc_samples', 8)))
-        x_rep = x_in.repeat_interleave(K, dim=0)
-        m_rep = m_in.repeat_interleave(K, dim=0)
-        out = model.elbo_sequence(x_rep, m_rep)
-        mean_rep = out['mean']  # [B*K, T, H]
-        mean_rep = mean_rep.view(B, K, mean_rep.shape[1], mean_rep.shape[2])
-        mean_seq = mean_rep.mean(dim=1).squeeze(0).cpu().numpy()  # [T, H]
+        y_pred_s = model.reconstruct_online(x_in, m_in, use_mean=True).squeeze(0).cpu().numpy().astype(np.float32)
 
-    # Unstandardize reconstruction to original scale; evaluate on target window only
-    # Unstandardize per-timestep using slot stats
-    mean_t = slot_mean[hours_ext]
-    std_t = slot_std[hours_ext]
-    rec_ext = mean_seq * std_t + mean_t
-    rec_target = rec_ext[-L:]
-    y_true = Xn_w.astype(np.float64)
-    y_pred = rec_target.astype(np.float64)
-    y_att = Xa_w.astype(np.float64)
+    # Unstandardize to original scale
+    mean_t = slot_mean[hours_all]
+    std_t = slot_std[hours_all]
+    y_pred = (y_pred_s * std_t + mean_t).astype(np.float32)
 
-    # Compute window-level NRMSE using fixed training scale (slot-wise std)
-    # Scale per time/feature uses the same slot stats as standardization
-    scale_win = std_t[-L:].astype(np.float64)
-    nrmse_rep = _normalized_rmse_window(y_true, y_pred, M_w, scale_win)
-    nrmse_att = _normalized_rmse_window(y_true, y_att, M_w, scale_win)
-    nrmse_impr = float(nrmse_att - nrmse_rep) if np.isfinite(nrmse_att) and np.isfinite(nrmse_rep) else float('nan')
+    # Compute per-timestamp observed-only MSE for attacked/repaired vs normal
+    def mse_timestep(y_true: np.ndarray, y_hat: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        T_, H_ = y_true.shape
+        out = np.full((T_), np.nan, dtype=np.float64)
+        for t in range(T_):
+            obs = mask[t] > 0.5
+            cnt = int(obs.sum())
+            if cnt > 0:
+                diff = y_hat[t, obs].astype(np.float64) - y_true[t, obs].astype(np.float64)
+                out[t] = float(np.mean(diff * diff))
+        return out
 
-    # Per-timestep metrics on observed positions; NRMSE uses fixed training scale
-    def _masked_metrics_per_timestep_fixedscale(
-        y_t: np.ndarray, y_p: np.ndarray, m: np.ndarray, sc: np.ndarray
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        if not (y_t.shape == y_p.shape == m.shape == sc.shape):
-            raise ValueError('y_true, y_pred, mask, scale must share shape [L,H]')
-        L_, H_ = y_t.shape
-        mse = np.full((L_,), np.nan, dtype=np.float64)
-        mae = np.full((L_,), np.nan, dtype=np.float64)
-        smape = np.full((L_,), np.nan, dtype=np.float64)
-        nrmse = np.full((L_,), np.nan, dtype=np.float64)
-        eps_sm = 1e-6
-        for t in range(L_):
-            obs = m[t] > 0.5
-            if not np.any(obs):
-                continue
-            yt = y_t[t, obs].astype(np.float64)
-            yp = y_p[t, obs].astype(np.float64)
-            sc_t = np.clip(sc[t, obs].astype(np.float64), eps_sm, None)
-            diff = yp - yt
-            se = diff * diff
-            ae = np.abs(diff)
-            mse[t] = se.mean()
-            mae[t] = ae.mean()
-            denom = np.abs(yt) + np.abs(yp) + eps_sm
-            smape[t] = 200.0 * np.mean(ae / denom)
-            nrmse[t] = float(np.sqrt(np.mean((diff / sc_t) ** 2)))
-        return mse, mae, smape, nrmse
+    mse_rep = mse_timestep(Xn, y_pred, M)
+    mse_att = mse_timestep(Xn, Xa, M)
 
-    mse_rep, mae_rep, smape_rep, nrmse_rep_ts = _masked_metrics_per_timestep_fixedscale(y_true, y_pred, M_w, scale_win)
-    mse_att, mae_att, smape_att, nrmse_att_ts = _masked_metrics_per_timestep_fixedscale(y_true, y_att, M_w, scale_win)
+    # Compute repair NRMSE (Observed Only), normalization from September normal per-feature across all time steps
+    # Scale sigma_09[j] computed on Xn[:, j] at observed positions only; robust via IQR/1.349 with floor and fallback.
+    def compute_sigma09_per_feature(x_normal: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        """Return per-feature robust std over the entire month [H]."""
+        T_all = x_normal.shape[0]
+        slots_all = np.zeros((T_all,), dtype=np.int64)  # single slot across the whole month
+        _, std_ = masked_robust_slot_stats(x_normal, mask, slots_all, slot_count=1)
+        # std_ has shape [1, H]; squeeze to [H]
+        return std_[0].astype(np.float64)
 
-    # Save detailed metrics.csv with per-timestamp rows and a bottom mean row
+    sigma09 = compute_sigma09_per_feature(Xn, M)  # [H]
+
+    def nrmse_timestep(y_true: np.ndarray, y_hat: np.ndarray, mask: np.ndarray, sigma_feat: np.ndarray) -> np.ndarray:
+        """Per-timestep NRMSE over observed positions only, normalized by per-feature sigma.
+
+        Shapes: y_true/y_hat [T,H], mask [T,H], sigma_feat [H].
+        """
+        T_, H_ = y_true.shape
+        if sigma_feat.shape[0] != H_:
+            raise ValueError('sigma_feat must have shape [H]')
+        out = np.full((T_), np.nan, dtype=np.float64)
+        inv_sigma2 = (1.0 / (sigma_feat.astype(np.float64) ** 2))
+        for t in range(T_):
+            obs = mask[t] > 0.5
+            cnt = int(obs.sum())
+            if cnt > 0:
+                diff = y_hat[t, obs].astype(np.float64) - y_true[t, obs].astype(np.float64)
+                # mean of ((diff/sigma)^2) over observed features at this timestamp
+                se_norm = (diff * diff) * inv_sigma2[obs]
+                out[t] = float(np.sqrt(np.mean(se_norm)))
+        return out
+
+    nrmse_rep = nrmse_timestep(Xn, y_pred, M, sigma09)
+    nrmse_att = nrmse_timestep(Xn, Xa, M, sigma09)
+
+    # Optional global NRMSE (Observed Only) as a single summary scalar for repaired series
+    def nrmse_global(y_true: np.ndarray, y_hat: np.ndarray, mask: np.ndarray, sigma_feat: np.ndarray) -> float:
+        obs = mask > 0.5
+        if not np.any(obs):
+            return float('nan')
+        diff = (y_hat.astype(np.float64) - y_true.astype(np.float64))
+        # broadcast sigma over time
+        sigma2 = (sigma_feat.astype(np.float64) ** 2).reshape(1, -1)
+        se_norm = (diff * diff) / sigma2
+        se_norm_obs = se_norm[obs]
+        return float(np.sqrt(np.mean(se_norm_obs)))
+
+    nrmse_rep_global = nrmse_global(Xn, y_pred, M, sigma09)
+    nrmse_att_global = nrmse_global(Xn, Xa, M, sigma09)
+    nrmse_improve = nrmse_att - nrmse_rep
+
+    # Terminal summary: Top-10 and Worst-10 by MSE repair effect (att - rep)
     df_a = pd.read_csv(args.infer_attacked_csv)
     ts_col = df_a.columns[0]
-    start_ts = str(ts_w.iloc[0])
-    end_ts_s = str(ts_w.iloc[-1])
-    metrics_detail = pd.DataFrame({
-        ts_col: ts_w,
-        'mse_att': mse_att, 'mae_att': mae_att, 'smape_att': smape_att, 'nrmse_att': nrmse_att_ts,
-        'mse_rep': mse_rep, 'mae_rep': mae_rep, 'smape_rep': smape_rep, 'nrmse_rep': nrmse_rep_ts,
-    })
-    mean_row_d = {
-        ts_col: 'mean',
-        'mse_att': float(np.nanmean(mse_att)), 'mae_att': float(np.nanmean(mae_att)), 'smape_att': float(np.nanmean(smape_att)), 'nrmse_att': float(np.nanmean(nrmse_att_ts)),
-        'mse_rep': float(np.nanmean(mse_rep)), 'mae_rep': float(np.nanmean(mae_rep)), 'smape_rep': float(np.nanmean(smape_rep)), 'nrmse_rep': float(np.nanmean(nrmse_rep_ts)),
-    }
-    metrics_detail = pd.concat([metrics_detail, pd.DataFrame([mean_row_d])], ignore_index=True)
-    metrics_path = os.path.join(outdir, 'metrics.csv')
-    tmp_path = metrics_path + '.tmp'
-    metrics_detail.to_csv(tmp_path, index=False)
-    try:
-        os.replace(tmp_path, metrics_path)
-    except Exception:
-        print(f"[warn] Could not replace metrics.csv; wrote {os.path.basename(tmp_path)} instead.")
-    # Clean up legacy name if any
-    legacy_path = os.path.join(outdir, 'metrics_detailed.csv')
-    try:
-        if os.path.exists(legacy_path):
-            os.remove(legacy_path)
-    except Exception:
-        pass
+    ts_s = ts.astype(str).values
 
-    # Pretty terminal summary: Top-10 by repair effect (att - rep) + overall means and window-NRMSE
-    def fmt(v: float, w: int = 8, p: int = 6) -> str:
+    def fmt(v: float, w: int = 10, p: int = 6) -> str:
         try:
             return f"{float(v):{w}.{p}f}"
         except Exception:
             return str(v)
-    print("\n===== Reconstruction Metrics (Observed Only) =====")
-    print(f"Window: [{start_ts} -> {end_ts_s}]  Length: {L}")
-    def top_k_improve(name: str, att: np.ndarray, rep: np.ndarray, k: int = 10) -> None:
-        valid = (~np.isnan(att)) & (~np.isnan(rep))
-        idx = np.where(valid)[0]
-        if idx.size == 0:
-            print(f"- {name}: no valid entries")
-            return
-        imp = att[idx] - rep[idx]
-        order = np.argsort(imp)[::-1]
-        take = idx[order][:min(k, len(order))]
-        print(f"\n- Top {min(k, len(take))} by repair {name} (att - rep)")
-        print("  Rank  Timestamp              att        rep        impr")
-        for r, t in enumerate(take, 1):
-            ts_s = str(ts_w.iloc[int(t)])
-            impr = att[t] - rep[t]
-            print(f"  {r:>4d}  {ts_s:>19s}  {fmt(att[t])}  {fmt(rep[t])}  {fmt(impr)}")
-    top_k_improve('MSE',   mse_att,   mse_rep)
-    top_k_improve('MAE',   mae_att,   mae_rep)
-    top_k_improve('NRMSE', nrmse_att_ts, nrmse_rep_ts)
-    top_k_improve('sMAPE', smape_att, smape_rep)
 
-    # Summary (means over window)
-    att_mean = {
-        'MSE': float(np.nanmean(mse_att)), 'MAE': float(np.nanmean(mae_att)), 'sMAPE': float(np.nanmean(smape_att)), 'NRMSE': float(np.nanmean(nrmse_att_ts)),
-    }
-    rep_mean = {
-        'MSE': float(np.nanmean(mse_rep)), 'MAE': float(np.nanmean(mae_rep)), 'sMAPE': float(np.nanmean(smape_rep)), 'NRMSE': float(np.nanmean(nrmse_rep_ts)),
-    }
-    print("\n- Summary (means over window)")
-    print("  Metric      att_mean    rep_mean    impr_mean")
-    for m in ('MSE','MAE','NRMSE','sMAPE'):
-        impr_mean = float(att_mean[m] - rep_mean[m])
-        print(f"  {m:<7s}  {fmt(att_mean[m])}  {fmt(rep_mean[m])}  {fmt(impr_mean)}")
+    valid = (~np.isnan(mse_att)) & (~np.isnan(mse_rep))
+    idx = np.where(valid)[0]
+    if idx.size == 0:
+        print('\n===== Reconstruction Metrics (Observed Only) =====')
+        print('- MSE: no valid entries (all-missing).')
+    else:
+        impr = mse_att[idx] - mse_rep[idx]
+        order_desc = np.argsort(impr)[::-1]
+        order_asc = np.argsort(impr)
+        top_idx = idx[order_desc][:min(10, len(order_desc))]
+        worst_idx = idx[order_asc][:min(10, len(order_asc))]
+        print('\n===== Reconstruction Metrics (Observed Only) =====')
+        print('- Top 10 by repair MSE (att - rep)')
+        print('  Rank  Timestamp              mse_att      mse_rep      improve')
+        for r, t in enumerate(top_idx, 1):
+            print(f"  {r:>4d}  {ts_s[int(t)]:>19s}  {fmt(mse_att[t])}  {fmt(mse_rep[t])}  {fmt(mse_att[t]-mse_rep[t])}")
+        print('\n- Worst 10 by repair MSE (att - rep)')
+        print('  Rank  Timestamp              mse_att      mse_rep      improve')
+        for r, t in enumerate(worst_idx, 1):
+            print(f"  {r:>4d}  {ts_s[int(t)]:>19s}  {fmt(mse_att[t])}  {fmt(mse_rep[t])}  {fmt(mse_att[t]-mse_rep[t])}")
 
-    # Window-level NRMSE summary using fixed scale
-    print("\n- Window-level NRMSE (slot-std scale)")
-    print(f"  nrmse_att: {fmt(nrmse_att)}  nrmse_rep: {fmt(nrmse_rep)}  improvement: {fmt(nrmse_impr)}")
+    # Report NRMSE (Observed Only) for attacked/repaired series
+    print('\n===== NRMSE Metrics (Observed Only, Sept feature-scale) =====')
+    print(f"- NRMSE (attacked vs normal): {nrmse_att_global:.6f}")
+    print(f"- NRMSE (repaired vs normal): {nrmse_rep_global:.6f}")
+    if np.isfinite(nrmse_att_global) and np.isfinite(nrmse_rep_global):
+        abs_imp = nrmse_att_global - nrmse_rep_global
+        rel_red = (1.0 - (nrmse_rep_global / max(nrmse_att_global, 1e-12))) * 100.0
+        print(f"- Absolute improvement (att - rep): {abs_imp:.6f}")
+        print(f"- Relative reduction: {rel_red:.2f}%")
+    else:
+        print('- Global NRMSE summary unavailable (insufficient valid entries).')
 
-    # Save three window slices: reconstructed, attacked, normal
+    # Per-timestamp NRMSE: Top/Worst by improvement (att - rep)
+    valid_np = (~np.isnan(nrmse_att)) & (~np.isnan(nrmse_rep))
+    idx_np = np.where(valid_np)[0]
+    if idx_np.size == 0:
+        print('- Per-timestamp NRMSE: no valid entries (all-missing).')
+    else:
+        impr_n = nrmse_att[idx_np] - nrmse_rep[idx_np]
+        order_desc_n = np.argsort(impr_n)[::-1]
+        order_asc_n = np.argsort(impr_n)
+        top_idx_n = idx_np[order_desc_n][:min(10, len(order_desc_n))]
+        worst_idx_n = idx_np[order_asc_n][:min(10, len(order_asc_n))]
+        print('\n- Top 10 by repair NRMSE (att - rep)')
+        print('  Rank  Timestamp              nrmse_att    nrmse_rep      improve')
+        for r, t in enumerate(top_idx_n, 1):
+            print(f"  {r:>4d}  {ts_s[int(t)]:>19s}  {fmt(nrmse_att[t])}  {fmt(nrmse_rep[t])}  {fmt(nrmse_att[t]-nrmse_rep[t])}")
+        print('\n- Worst 10 by repair NRMSE (att - rep)')
+        print('  Rank  Timestamp              nrmse_att    nrmse_rep      improve')
+        for r, t in enumerate(worst_idx_n, 1):
+            print(f"  {r:>4d}  {ts_s[int(t)]:>19s}  {fmt(nrmse_att[t])}  {fmt(nrmse_rep[t])}  {fmt(nrmse_att[t]-nrmse_rep[t])}")
+
+    # Save single reconstructed CSV for full series
     cols = list(df_a.columns)
-    # Reconstructed window
     rec_df = pd.DataFrame(columns=cols)
-    rec_df[ts_col] = ts_w
+    rec_df[ts_col] = ts
     rec_df.iloc[:, 1:] = y_pred.astype(np.float32)
-    rec_df.to_csv(os.path.join(outdir, 'reconstructed_window.csv'), index=False)
-    # Attacked slice
-    attacked_slice = df_a.iloc[idx_start:idx_end+1].reset_index(drop=True)
-    attacked_slice.to_csv(os.path.join(outdir, 'attacked_window.csv'), index=False)
-    # Normal slice
-    df_n = pd.read_csv(args.infer_normal_csv)
-    normal_slice = df_n.iloc[idx_start:idx_end+1].reset_index(drop=True)
-    normal_slice.to_csv(os.path.join(outdir, 'normal_window.csv'), index=False)
+    rec_path = os.path.join(outdir, 'reconstructed.csv')
+    tmp_path = rec_path + '.tmp'
+    rec_df.to_csv(tmp_path, index=False)
+    try:
+        os.replace(tmp_path, rec_path)
+    except Exception:
+        print(f"[warn] Could not replace reconstructed.csv; wrote {os.path.basename(tmp_path)} instead.")
 
-    print('Inference finished. Outputs saved to:', outdir)
+    print('Inference finished. Reconstructed series saved to:', rec_path)
 
 
 if __name__ == '__main__':

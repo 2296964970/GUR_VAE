@@ -52,9 +52,8 @@ def _defaults() -> Dict[str, Any]:
         # Data roots (kept for output layout compatibility)
         'data_dir': 'input',
         'case': 'case14',
-        # Explicit paired CSVs
+        # Explicit CSVs
         'train_normal_csv': '',
-        'train_attacked_csv': '',
         'infer_normal_csv': '',
         'infer_attacked_csv': '',
         # Windowing/common
@@ -79,10 +78,10 @@ def _defaults() -> Dict[str, Any]:
         'device': 'cpu',
         # Checkpoint
         'ckpt': '',
-        # Inference window
-        'infer_end_timestamp': '',
-        'infer_length': 96,
-        'infer_mc_samples': 8,
+        # Inference window removed in simplified pipeline
+        # Noise (FDIA injection for training/validation)
+        'noise_strength': 0.5,
+        'noise_seed': 1337,
     }
 
 
@@ -102,14 +101,11 @@ def _flatten_config(raw: Dict[str, Any]) -> Dict[str, Any]:
     d['data_dir'] = _deep_get(raw, 'global.data_dir', d['data_dir'])
     d['case'] = _deep_get(raw, 'global.case', d['case'])
 
-    # Paired CSVs
+    # CSV paths
     d['train_normal_csv'] = _deep_get(raw, 'train.normal_csv', d['train_normal_csv'])
-    d['train_attacked_csv'] = _deep_get(raw, 'train.attacked_csv', d['train_attacked_csv'])
     d['infer_normal_csv'] = _deep_get(raw, 'infer.normal_csv', d['infer_normal_csv'])
     d['infer_attacked_csv'] = _deep_get(raw, 'infer.attacked_csv', d['infer_attacked_csv'])
-    d['infer_end_timestamp'] = str(_deep_get(raw, 'infer.end_timestamp', d['infer_end_timestamp']))
-    d['infer_length'] = int(_deep_get(raw, 'infer.length', d['infer_length']))
-    d['infer_mc_samples'] = int(_deep_get(raw, 'infer.mc_samples', d['infer_mc_samples']))
+    # No window/MC flattening for inference in simplified pipeline
 
     # Window
     d['time_length'] = int(_deep_get(raw, 'window.time_length', d['time_length']))
@@ -118,7 +114,9 @@ def _flatten_config(raw: Dict[str, Any]) -> Dict[str, Any]:
     d['train_ratio'] = float(_deep_get(raw, 'window.train_ratio', d['train_ratio']))
     d['val_ratio'] = float(_deep_get(raw, 'window.val_ratio', d['val_ratio']))
 
-    # No masking/noise options in paired setting
+    # Noise
+    d['noise_strength'] = float(_deep_get(raw, 'noise.strength', d['noise_strength']))
+    d['noise_seed'] = int(_deep_get(raw, 'noise.seed', d['noise_seed']))
 
     # Model
     # Allow dec_hidden as list[int] or comma string
@@ -154,20 +152,15 @@ def _flatten_config(raw: Dict[str, Any]) -> Dict[str, Any]:
 def _validate_training_policy(flat: Dict[str, Any]) -> None:
     """Guardrails for experimental paired training.
 
-    - Allow train_attacked_csv to contain 'fdia' only for 2025-07_2025-08 period.
     - Forbid any '2025-09' in training CSVs.
     - Forbid 'fdia' in train_normal_csv.
     """
     n = str(flat.get('train_normal_csv') or '').strip().lower()
-    a = str(flat.get('train_attacked_csv') or '').strip().lower()
     if n:
         if 'fdia' in n:
             raise SystemExit('[error] train.normal_csv must not contain fdia')
         if '2025-09' in n:
             raise SystemExit('[error] train.normal_csv must not contain 2025-09')
-    if a:
-        if '2025-09' in a:
-            raise SystemExit('[error] train.attacked_csv must not contain 2025-09')
 
 
 def load_config(path: str | None = None) -> SimpleNamespace:

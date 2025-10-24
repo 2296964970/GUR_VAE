@@ -12,6 +12,7 @@ models/
 logs/
 runs/
 checkpoints/
+output/
 outputs/
 results/
 

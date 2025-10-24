@@ -33,10 +33,7 @@ def load_timeseries(csv_path: str) -> Tuple[np.ndarray, np.ndarray, pd.Series]:
     return X, M_struct, ts
 
 
-def _apply_standardization(x: np.ndarray, m: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
-    x_scaled = (x - mean) / std
-    x_proc = np.where(m > 0.5, x_scaled, 0.0)
-    return x_proc.astype(np.float32)
+# Removed unused legacy standardization helper to keep API minimal.
 
 
 def _window_indices(T: int, window: int, stride: int) -> np.ndarray:
@@ -57,10 +54,29 @@ def _make_worker_init_fn(base_seed: Optional[int]):
     return _fn
 
 
-class SlidingWindowDataset(Dataset):
-    def __init__(self, x: np.ndarray, m: np.ndarray, window: int, stride: int = 1):
-        # Deprecated in favor of PairedSlidingWindowDataset
-        raise NotImplementedError('SlidingWindowDataset is deprecated; use PairedSlidingWindowDataset')
+class NormalSlidingWindowDataset(Dataset):
+    """Windows for normal-only training with FDIA injection upstream.
+
+    Returns (x_normal_window, m_struct_window), both [L,H].
+    """
+
+    def __init__(self, x_normal: np.ndarray, m_struct: np.ndarray, window: int, stride: int = 1):
+        if x_normal.shape != m_struct.shape:
+            raise ValueError('x_normal and m_struct must share shape [T,H]')
+        self.T, self.H = x_normal.shape
+        self.window = int(window)
+        self.stride = int(stride)
+        self.starts = _window_indices(self.T, self.window, self.stride)
+        self.xn = torch.from_numpy(x_normal)
+        self.m = torch.from_numpy(m_struct)
+
+    def __len__(self) -> int:
+        return len(self.starts)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, ...]:
+        s = self.starts[idx]
+        e = s + self.window
+        return self.xn[s:e], self.m[s:e]
 
 
 class PairedSlidingWindowDataset(Dataset):
@@ -94,8 +110,6 @@ class DataModule:
     train: DataLoader
     val: DataLoader
     test: DataLoader
-    mean: np.ndarray
-    std: np.ndarray
     slot_mean: np.ndarray
     slot_std: np.ndarray
     slot_kind: str
@@ -112,12 +126,6 @@ def times_to_hour_index(ts: pd.Series) -> np.ndarray:
     return hours.astype(np.int64)
 
 
-def masked_mean_std(x: np.ndarray, m: np.ndarray, eps: float = 1e-6) -> Tuple[np.ndarray, np.ndarray]:
-    count = np.maximum(m.sum(axis=0), 1.0)
-    mean = (x * m).sum(axis=0) / count
-    var = (((x - mean) * m) ** 2).sum(axis=0) / count
-    std = np.sqrt(np.maximum(var, eps))
-    return mean.astype(np.float32), std.astype(np.float32)
 
 
 def masked_robust_slot_stats(
@@ -223,10 +231,9 @@ def load_paired_timeseries(normal_csv: str, attacked_csv: str) -> Tuple[np.ndarr
     return Xa, Xn, Mn.astype(np.float32), tsn
 
 
-def create_paired_loaders(
+def create_normal_loaders(
     *,
     train_normal_csv: str,
-    train_attacked_csv: str,
     time_length: int = 96,
     stride: int = 48,
     batch_size: int = 64,
@@ -235,17 +242,17 @@ def create_paired_loaders(
     seed: Optional[int] = 1337,
     num_workers: int = 0,
 ) -> DataModule:
-    Xa, Xn, M_struct, ts = load_paired_timeseries(train_normal_csv, train_attacked_csv)
-    T, H = Xa.shape
+    Xn, M_struct, ts = load_timeseries(train_normal_csv)
+    T, H = Xn.shape
     train_T = int(T * train_ratio)
     val_T = int(T * val_ratio)
     s_train = slice(0, train_T)
     s_val = slice(train_T, train_T + val_T)
     s_test = slice(train_T + val_T, T)
 
-    Xa_tr, Xn_tr, M_tr = Xa[s_train], Xn[s_train], M_struct[s_train]
-    Xa_va, Xn_va, M_va = Xa[s_val], Xn[s_val], M_struct[s_val]
-    Xa_te, Xn_te, M_te = Xa[s_test], Xn[s_test], M_struct[s_test]
+    Xn_tr, M_tr = Xn[s_train], M_struct[s_train]
+    Xn_va, M_va = Xn[s_val], M_struct[s_val]
+    Xn_te, M_te = Xn[s_test], M_struct[s_test]
 
     # Slot-wise robust standardization computed from training normal only (hour-of-day)
     hours = times_to_hour_index(ts)
@@ -254,16 +261,13 @@ def create_paired_loaders(
     hours_te = hours[s_test]
     slot_mean, slot_std = masked_robust_slot_stats(Xn_tr, M_tr, hours_tr, slot_count=24)
     CLIP_K = 5.0
-    Xa_tr_s = apply_standardization_slotwise(Xa_tr, M_tr, hours_tr, slot_mean, slot_std, clip_k=CLIP_K)
     Xn_tr_s = apply_standardization_slotwise(Xn_tr, M_tr, hours_tr, slot_mean, slot_std, clip_k=CLIP_K)
-    Xa_va_s = apply_standardization_slotwise(Xa_va, M_va, hours_va, slot_mean, slot_std, clip_k=CLIP_K)
     Xn_va_s = apply_standardization_slotwise(Xn_va, M_va, hours_va, slot_mean, slot_std, clip_k=CLIP_K)
-    Xa_te_s = apply_standardization_slotwise(Xa_te, M_te, hours_te, slot_mean, slot_std, clip_k=CLIP_K)
     Xn_te_s = apply_standardization_slotwise(Xn_te, M_te, hours_te, slot_mean, slot_std, clip_k=CLIP_K)
 
-    ds_train = PairedSlidingWindowDataset(Xa_tr_s, Xn_tr_s, M_tr.astype(np.float32), time_length, stride)
-    ds_val = PairedSlidingWindowDataset(Xa_va_s, Xn_va_s, M_va.astype(np.float32), time_length, stride)
-    ds_test = PairedSlidingWindowDataset(Xa_te_s, Xn_te_s, M_te.astype(np.float32), time_length, stride)
+    ds_train = NormalSlidingWindowDataset(Xn_tr_s, M_tr.astype(np.float32), time_length, stride)
+    ds_val = NormalSlidingWindowDataset(Xn_va_s, M_va.astype(np.float32), time_length, stride)
+    ds_test = NormalSlidingWindowDataset(Xn_te_s, M_te.astype(np.float32), time_length, stride)
 
     wif_train = _make_worker_init_fn(seed)
     wif_val = _make_worker_init_fn(None if seed is None else seed + 1)
@@ -271,14 +275,10 @@ def create_paired_loaders(
     dl_train = DataLoader(ds_train, batch_size=batch_size, shuffle=True, num_workers=num_workers, worker_init_fn=wif_train)
     dl_val = DataLoader(ds_val, batch_size=batch_size, shuffle=False, num_workers=num_workers, worker_init_fn=wif_val)
     dl_test = DataLoader(ds_test, batch_size=batch_size, shuffle=False, num_workers=num_workers, worker_init_fn=wif_test)
-    # Legacy mean/std kept for compatibility; compute simple masked mean/std on training
-    mean_legacy, std_legacy = masked_mean_std(Xn_tr, M_tr)
     return DataModule(
         train=dl_train,
         val=dl_val,
         test=dl_test,
-        mean=mean_legacy,
-        std=std_legacy,
         slot_mean=slot_mean,
         slot_std=slot_std,
         slot_kind='hour',
@@ -291,7 +291,8 @@ __all__ = [
     'load_timeseries',
     'load_paired_timeseries',
     'PairedSlidingWindowDataset',
-    'create_paired_loaders',
+    'NormalSlidingWindowDataset',
+    'create_normal_loaders',
     'DataModule',
     'times_to_hour_index',
     'apply_standardization_slotwise',

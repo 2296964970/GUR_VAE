@@ -6,7 +6,6 @@ global:
 # Paired data paths (explicit)
 train:
   normal_csv: input/case14/train/case14_2025-07_2025-08_clean_noisy.csv
-  attacked_csv: input/case14/train/case14_fdia_2025-07_2025-08_noisy.csv
   epochs: 40
   seed: 1337
   learning_rate: 0.0003
@@ -16,11 +15,8 @@ train:
   ckpt: output/case14/models/gru_base_ep40/ckpt.pt
 
 infer:
-  normal_csv: input/case14/infer/case14_2025-09_clean_noisy.csv
+  normal_csv: input\case14\infer\case14_2025-09_clean_noisy.csv
   attacked_csv: input/case14/infer/case14_fdia_2025-09_noisy.csv
-  end_timestamp: "2025/09/08 17:00"   # the inclusive end time of the repair window
-  length: 96                           # number of steps in the window
-  mc_samples: 8                        # Monte Carlo samples for inference averaging
 
 # Windowing and batching
 window:
@@ -29,6 +25,11 @@ window:
   batch_size: 64
   train_ratio: 0.7
   val_ratio: 0.15
+
+# FDIA noise injection (training/validation)
+noise:
+  strength: 0.5
+  seed: 1337
 
 # Model hyperparameters
 model:

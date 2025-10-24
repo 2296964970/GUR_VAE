@@ -4,7 +4,7 @@ import random
 import numpy as np
 import torch
 
-from gru_vae.data import create_paired_loaders
+from gru_vae.data import create_normal_loaders
 from gru_vae.trainer import OnlineTrainer
 from gru_vae.utils import parse_sizes, resolve_device, first_batch_or_exit
 from gru_vae.model import OnlineGPVAE
@@ -24,9 +24,8 @@ def main() -> None:
 
     set_seed(args.seed)
 
-    loaders = create_paired_loaders(
+    loaders = create_normal_loaders(
         train_normal_csv=args.train_normal_csv,
-        train_attacked_csv=args.train_attacked_csv,
         time_length=args.time_length,
         stride=args.stride,
         batch_size=args.batch_size,
@@ -60,6 +59,8 @@ def main() -> None:
         device=device,
         grad_clip=args.grad_clip,
         beta=args.beta,
+        noise_strength=getattr(args, 'noise_strength', 0.5),
+        noise_seed=getattr(args, 'noise_seed', 1337),
     )
 
     # Enforce output directory layout: output/<case>/models/<exp_name>

@@ -8,6 +8,7 @@ from torch.utils.data import DataLoader
 
 from .model import OnlineGPVAE
 from .metrics import batch_metrics
+from .utils import apply_fdia_noise
 
 
 @dataclass
@@ -27,6 +28,8 @@ def _run_epoch(
     grad_clip: float,
     beta: Optional[float],
     train: bool,
+    noise_strength: Optional[float] = None,
+    noise_generator: Optional[torch.Generator] = None,
 ) -> EpochStats:
     elbo_fn = model.elbo_sequence
     if train and optimizer is None:
@@ -47,6 +50,11 @@ def _run_epoch(
         x_input = x_input.float().to(device)
         m = m.float().to(device)
         x_target = x_target.float().to(device)
+
+        # FDIA injection: only when dataset provides (x, m) i.e., two-tensor batches
+        if len(batch) == 2 and noise_strength is not None and noise_generator is not None:
+            with torch.no_grad():
+                x_input = apply_fdia_noise(x_target, m, strength=float(noise_strength), generator=noise_generator, fraction=0.15)
 
         if train:
             assert optimizer is not None
@@ -89,6 +97,8 @@ class OnlineTrainer:
         device: Optional[torch.device] = None,
         grad_clip: float = 1e4,
         beta: Optional[float] = None,
+        noise_strength: Optional[float] = None,
+        noise_seed: Optional[int] = None,
     ) -> None:
         self.model = model
         self.optimizer = optimizer
@@ -96,6 +106,14 @@ class OnlineTrainer:
         self.grad_clip = float(grad_clip)
         self.beta = beta
         self.model.to(self.device)
+        self.noise_strength = noise_strength
+        # Use CPU generator for reproducibility; noise tensors will be moved to device
+        if noise_seed is not None:
+            g = torch.Generator(device='cpu')
+            g.manual_seed(int(noise_seed))
+            self.noise_gen = g
+        else:
+            self.noise_gen = None
 
     def _to_device(self, *tensors: torch.Tensor):
         return tuple(t.to(self.device) for t in tensors)
@@ -110,6 +128,8 @@ class OnlineTrainer:
             grad_clip=self.grad_clip,
             beta=self.beta,
             train=True,
+            noise_strength=self.noise_strength,
+            noise_generator=self.noise_gen,
         )
 
     @torch.no_grad()
@@ -123,6 +143,8 @@ class OnlineTrainer:
             grad_clip=self.grad_clip,
             beta=self.beta,
             train=False,
+            noise_strength=self.noise_strength,
+            noise_generator=self.noise_gen,
         )
 
     # No legacy bulk-imputation APIs are provided.
