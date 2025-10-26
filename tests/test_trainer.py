@@ -1,7 +1,7 @@
 import torch
 from torch.utils.data import DataLoader, TensorDataset
-from gru_vae.model import OnlineGPVAE
-from gru_vae.trainer import OnlineTrainer
+from tcn_vae.model import TCNVAE
+from tcn_vae.trainer import OnlineTrainer
 
 
 def test_trainer_single_epoch_smoke():
@@ -12,7 +12,7 @@ def test_trainer_single_epoch_smoke():
     ds = TensorDataset(x, m, x)
     loader = DataLoader(ds, batch_size=4, shuffle=False)
 
-    model = OnlineGPVAE(input_dim=H, output_dim=H, latent_dim=Z, enc_hidden_size=16)
+    model = TCNVAE(input_dim=H, output_dim=H, latent_dim=Z, tcn_channels=(16,), tcn_kernel_size=3)
     optim = torch.optim.Adam(model.parameters(), lr=1e-3)
     trainer = OnlineTrainer(model, optim, device=torch.device('cpu'))
 

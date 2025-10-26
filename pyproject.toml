@@ -3,17 +3,18 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "gru-vae"
+name = "tcn-vae"
 version = "0.1.0"
 requires-python = ">=3.9"
 dependencies = [
   "torch",
   "numpy",
-  "pandas"
+  "pandas",
+  "PyYAML"
 ]
 authors = [{name="Research Team"}]
-description = "Online GRU-VAE for FDIA repair"
+description = "Online TCN-VAE for FDIA repair"
 readme = "README.md"
 
 [tool.setuptools]
-packages = ["gru_vae"]
+packages = ["tcn_vae"]

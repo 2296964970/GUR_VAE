@@ -1,6 +1,6 @@
 import torch
-from gru_vae.metrics import gaussian_nll_observed, mse_missing, mse_observed
-from gru_vae.data import PairedSlidingWindowDataset
+from tcn_vae.metrics import gaussian_nll_observed, mse_missing, mse_observed
+from tcn_vae.data import PairedSlidingWindowDataset
 import numpy as np
 
 

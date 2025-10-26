@@ -1,6 +1,5 @@
 # Global dataset selection
 global:
-  data_dir: input
   case: case14
 
 # Paired data paths (explicit)
@@ -10,9 +9,9 @@ train:
   seed: 1337
   learning_rate: 0.0003
   grad_clip: 10000.0
-  exp_name: gru_base_ep40
+  exp_name: tcn_base_ep40
   device: cpu         # cpu | cuda
-  ckpt: output/case14/models/gru_base_ep40/ckpt.pt
+  ckpt: output/case14/models/tcn_base_ep40/ckpt.pt
 
 infer:
   normal_csv: input\case14\infer\case14_2025-09_clean_noisy.csv
@@ -30,12 +29,14 @@ window:
 noise:
   strength: 0.5
   seed: 1337
+  fractions: [0.1, 0.05, 0.02, 0.15, 0.3, 0.4]
 
 # Model hyperparameters
 model:
   latent_dim: 64
   dec_hidden: "256,256"  # comma-separated or a YAML list, e.g., [256, 256]
-  gru_hidden: 256
-  gru_layers: 1
+  tcn_channels: "256,256,256,256,256"  # 5 layers: receptive field ~125 steps
+  tcn_kernel_size: 3
+  tcn_dropout: 0.0
   beta: 0.1
   obs_init_logvar: -3.5

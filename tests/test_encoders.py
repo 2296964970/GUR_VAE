@@ -1,34 +1,32 @@
 import torch
-from gru_vae.encoders import CausalGRUEncoder
+from tcn_vae.encoders import CausalTCNEncoder
 
 
-def test_gru_encoder_shapes():
+def test_tcn_encoder_shapes():
     B, T, H, Z = 2, 5, 7, 3
-    enc = CausalGRUEncoder(input_dim=H, z_size=Z, hidden_size=11, num_layers=2)
+    enc = CausalTCNEncoder(input_dim=H, z_size=Z, channels=(11, 13), kernel_size=3, dropout=0.0)
     x = torch.randn(B, T, H)
-    mu, logvar = enc(x)
+    mu, chol = enc(x)
     assert mu.shape == (B, Z, T)
-    assert logvar.shape == (B, Z, T)
+    assert chol.shape == (B, T, Z, Z)
+    # Cholesky factors must be lower-triangular with positive diagonal
+    for t in range(T):
+        L_t = chol[:, t]
+        assert torch.allclose(L_t, torch.tril(L_t), atol=1e-6)
+        assert torch.all(torch.diagonal(L_t, dim1=-2, dim2=-1) > 0)
 
 
-def test_gru_encoder_step_and_init():
-    B, H, Z = 2, 7, 3
-    enc = CausalGRUEncoder(input_dim=H, z_size=Z, hidden_size=13, num_layers=1)
-    h0 = enc.init_hidden(B)
-    x_t = torch.randn(B, H)
-    mu_t, lv_t, h1 = enc.step(x_t, h0)
-    assert mu_t.shape == (B, Z)
-    assert lv_t.shape == (B, Z)
-    assert h1.shape == h0.shape
-
-
-def test_gru_encoder_invalid_shapes():
-    B, H, Z = 2, 4, 3
-    enc = CausalGRUEncoder(input_dim=H, z_size=Z, hidden_size=8, num_layers=1)
-    h0 = enc.init_hidden(B)
-    bad_x = torch.randn(B, H + 1)
-    try:
-        enc.step(bad_x, h0)
-        assert False, 'expected ValueError for bad input dim'
-    except ValueError:
-        pass
+def test_tcn_encoder_causality():
+    # Construct two inputs that share the same prefix, different suffix.
+    B, T, H, Z = 1, 16, 4, 2
+    enc = CausalTCNEncoder(input_dim=H, z_size=Z, channels=(8, 8), kernel_size=3, dropout=0.0)
+    enc.eval()
+    x1 = torch.randn(B, T, H)
+    x2 = x1.clone()
+    # Make suffix (after t0) different
+    t0 = T // 2
+    x2[:, t0:, :] = torch.randn(B, T - t0, H)
+    mu1, _ = enc(x1)
+    mu2, _ = enc(x2)
+    # Outputs up to and including t0-1 must be identical
+    assert torch.allclose(mu1[:, :, :t0], mu2[:, :, :t0], atol=1e-6, rtol=0.0)

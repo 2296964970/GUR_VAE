@@ -127,7 +127,6 @@ def times_to_hour_index(ts: pd.Series) -> np.ndarray:
 
 
 
-
 def masked_robust_slot_stats(
     x: np.ndarray,
     m: np.ndarray,
@@ -185,7 +184,7 @@ def apply_standardization_slotwise(
     slot_mean: np.ndarray,
     slot_std: np.ndarray,
     *,
-    clip_k: float = 5.0,
+    clip_k: float = 0.0,
 ) -> np.ndarray:
     """Apply per-slot robust z-score and gate by mask.
 
@@ -197,8 +196,9 @@ def apply_standardization_slotwise(
     mean_t = slot_mean[idx]
     std_t = slot_std[idx]
     x_scaled = (x - mean_t) / std_t
-    if clip_k is not None and clip_k > 0:
-        x_scaled = np.clip(x_scaled, -float(clip_k), float(clip_k))
+    clip_val = float(clip_k)
+    if clip_val > 0.0:
+        x_scaled = np.clip(x_scaled, -clip_val, clip_val)
     x_proc = np.where(m > 0.5, x_scaled, 0.0).astype(np.float32)
     return x_proc
 
@@ -260,7 +260,7 @@ def create_normal_loaders(
     hours_va = hours[s_val]
     hours_te = hours[s_test]
     slot_mean, slot_std = masked_robust_slot_stats(Xn_tr, M_tr, hours_tr, slot_count=24)
-    CLIP_K = 5.0
+    CLIP_K = 0.0
     Xn_tr_s = apply_standardization_slotwise(Xn_tr, M_tr, hours_tr, slot_mean, slot_std, clip_k=CLIP_K)
     Xn_va_s = apply_standardization_slotwise(Xn_va, M_va, hours_va, slot_mean, slot_std, clip_k=CLIP_K)
     Xn_te_s = apply_standardization_slotwise(Xn_te, M_te, hours_te, slot_mean, slot_std, clip_k=CLIP_K)

@@ -1,11 +1,11 @@
-# GRU-VAE: Generative Reconstruction for FDIA
+# TCN-VAE: Generative Reconstruction for FDIA
 
-End-to-end GRU-Variational Autoencoder (GRU-VAE) for power-system measurement streams. The model learns nominal trajectories and reconstructs attacked inputs by aligning them with the paired normal sequence at the same timestamps, using observed-only losses.
+End-to-end Temporal Convolutional Network Variational Autoencoder (TCN-VAE) for power-system measurement streams. The model learns nominal trajectories and reconstructs attacked inputs by aligning them with the paired normal sequence at the same timestamps, using observed-only losses.
 
 ---
 
 ## Repository Layout
-- `gru_vae/` Core library (data loaders, model, trainer, metrics, config).
+- `tcn_vae/` Core library (data loaders, model, trainer, metrics, config).
 - `scripts/train.py` Train on normal-only windows with FDIA noise injection (per-step sparse attacks) and observed-only NLL + KL.
 - `scripts/infer_reconstruct.py` Reconstruct attacked sequences over a specified window and report observed-space metrics.
 - `input/` Example datasets and structure description.
@@ -108,7 +108,7 @@ Outputs are written under `output/<case>/infer/<exp_name>/`:
 ---
 
 ## Model Overview
-- Encoder: causal GRU produces per-step diagonal Gaussian `q(z_t|x_<=t)`.
+- Encoder: causal TCN produces per-step diagonal Gaussian `q(z_t|x_<=t)`.
 - Prior: AR(1) state-space model with optional low-rank noise.
 - Decoder: MLP outputs per-step Gaussian mean and log-variance.
 - Training objective: observed-only Gaussian NLL + KL regularization (with warm-up).
@@ -136,11 +136,14 @@ Outputs are written under `output/<case>/infer/<exp_name>/`:
 - Terminal summary: prints Top-10 and Worst-10 timestamps by MSE repair effect (att - rep) on observed positions only.
 
 ## Configuration Notes
-- `infer.mc_samples` (int): number of MC samples for inference averaging (default: 8).
+- Model hyperparameters:
+  - `model.tcn_channels`: comma-separated string or YAML list (e.g., "256,256,256").
+  - `model.tcn_kernel_size`: positive int (e.g., 3).
+  - `model.tcn_dropout`: float in [0,1] (default 0.0).
 - Encoder inputs are mask-aware via concatenation `[x*mask, mask]`; the mask derives from `NaN` positions and is enforced identical across paired CSVs.
 - Decoder predicts time-varying mean and log-variance; a hard upper bound on log-variance prevents variance blow-up.
 
 ---
 
 ## License
-Research use within the GRU-VAE FDIA defense project. See forthcoming license documentation for details.
+Research use within the TCN-VAE FDIA defense project. See forthcoming license documentation for details.

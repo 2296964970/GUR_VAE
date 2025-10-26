@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Tuple
 
 import torch
+import math
 
 
 def parse_sizes(s: str) -> Tuple[int, ...]:
@@ -34,13 +35,6 @@ def validate_bth(x: torch.Tensor, name: str = 'x') -> Tuple[int, int, int]:
     B, T, H = x.shape
     return int(B), int(T), int(H)
 
-
-def validate_bh(x: torch.Tensor, name: str = 'x_t') -> Tuple[int, int]:
-    if x.ndim != 2:
-        raise ValueError(f"{name} must have shape [B,H]")
-    B, H = x.shape
-    return int(B), int(H)
-
 __all__ = ['parse_sizes', 'resolve_device', 'first_batch_or_exit']
  
 def apply_fdia_noise(
@@ -50,6 +44,7 @@ def apply_fdia_noise(
     strength: float,
     generator: torch.Generator,
     fraction: float = 0.15,
+    fraction_choices: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Apply FDIA-like sparse Gaussian noise per time step on observed features.
 
@@ -58,6 +53,8 @@ def apply_fdia_noise(
     - strength: stddev of Gaussian noise in standardized domain
     - generator: RNG for reproducibility (CPU generator is acceptable; noise will be moved to device)
     - fraction: per-step feature fraction to attack (constant, not exposed to config)
+    - fraction_choices: optional tensor of candidate per-step fractions; when provided,
+      a value is sampled (with replacement) for each (batch, time) pair.
 
     For each batch b and time t, sample an attack subset over observed features with Bernoulli(fraction).
     If no observed feature is selected, force-select ceil(fraction * N_obs) random observed features (or 1 if N_obs>0).
@@ -67,6 +64,15 @@ def apply_fdia_noise(
         raise ValueError('x and mask must share shape [B,T,H]')
     if not (0.0 <= fraction <= 1.0):
         raise ValueError('fraction must be in [0,1]')
+    if fraction_choices is not None:
+        if fraction_choices.ndim != 1:
+            raise ValueError('fraction_choices must be a 1D tensor if provided')
+        if fraction_choices.numel() == 0:
+            fraction_choices = None
+        else:
+            if (fraction_choices < 0.0).any() or (fraction_choices > 1.0).any():
+                raise ValueError('fraction_choices values must lie within [0, 1]')
+            fraction_choices = fraction_choices.to(dtype=torch.float32, device='cpu')
     B, T, H = x.shape
     device = x.device
     dtype = x.dtype
@@ -77,30 +83,31 @@ def apply_fdia_noise(
     frac = float(fraction)
     for b in range(B):
         for t in range(T):
+            frac_bt = frac
+            if fraction_choices is not None:
+                choice_idx = torch.randint(
+                    low=0,
+                    high=fraction_choices.numel(),
+                    size=(1,),
+                    generator=generator,
+                    dtype=torch.int64,
+                ).item()
+                frac_bt = float(fraction_choices[choice_idx].item())
+                frac_bt = max(0.0, min(1.0, frac_bt))
             obs_idx = (m_cpu[b, t, :] > 0.5).nonzero(as_tuple=False).flatten()
             n_obs = int(obs_idx.numel())
             if n_obs == 0:
-                # No observed features; fall back to full domain sampling (will be masked out later)
-                # Still generate noise vector for shape consistency
-                noise_vec = torch.randn(H, generator=generator, dtype=dtype)
-                out_cpu[b, t, :] = x_cpu[b, t, :] + strength * noise_vec * m_cpu[b, t, :]
                 continue
-            # Bernoulli sampling over observed set
-            p = torch.full((n_obs,), frac, dtype=dtype)
-            bern = torch.bernoulli(p, generator=generator)
-            sel = bern > 0.5
-            if int(sel.sum().item()) == 0:
-                # Force-select ceil(frac * n_obs), at least 1
-                k = max(1, int((frac * n_obs + 0.9999) // 1))
-                perm = torch.randperm(n_obs, generator=generator)
-                take = perm[:k]
-                att_idx = obs_idx[take]
-            else:
-                att_idx = obs_idx[sel]
-            attack_mask = torch.zeros(H, dtype=dtype)
-            attack_mask[att_idx] = 1.0
-            noise_vec = torch.randn(H, generator=generator, dtype=dtype)
-            out_cpu[b, t, :] = x_cpu[b, t, :] + strength * noise_vec * attack_mask
+            if frac_bt <= 0.0:
+                continue
+            cluster_size = max(1, int(math.ceil(frac_bt * n_obs)))
+            perm = torch.randperm(n_obs, generator=generator)
+            sel_idx = obs_idx[perm[:cluster_size]]
+            # Generate a coordinated shift shared across the attacked subset
+            shared_shift = torch.randn((), generator=generator, dtype=dtype) * strength
+            small_jitter = torch.randn(cluster_size, generator=generator, dtype=dtype) * (0.1 * strength)
+            attack_values = shared_shift + small_jitter
+            out_cpu[b, t, sel_idx] = x_cpu[b, t, sel_idx] + attack_values
     return out_cpu.to(device=device)
 
 __all__ += ['apply_fdia_noise']

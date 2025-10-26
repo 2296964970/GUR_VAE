@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 from torch.utils.data import DataLoader
 
-from .model import OnlineGPVAE
+from .model import TCNVAE
 from .metrics import batch_metrics
 from .utils import apply_fdia_noise
 
@@ -21,7 +21,7 @@ class EpochStats:
 
 def _run_epoch(
     *,
-    model: OnlineGPVAE,
+    model: TCNVAE,
     loader: DataLoader,
     optimizer: Optional[torch.optim.Optimizer],
     device: torch.device,
@@ -30,8 +30,9 @@ def _run_epoch(
     train: bool,
     noise_strength: Optional[float] = None,
     noise_generator: Optional[torch.Generator] = None,
+    noise_fractions: Optional[torch.Tensor] = None,
+    noise_fraction_base: float = 0.15,
 ) -> EpochStats:
-    elbo_fn = model.elbo_sequence
     if train and optimizer is None:
         raise ValueError('optimizer must be provided when train=True')
     total_loss = torch.zeros((), device=device, dtype=torch.float64)
@@ -54,7 +55,14 @@ def _run_epoch(
         # FDIA injection: only when dataset provides (x, m) i.e., two-tensor batches
         if len(batch) == 2 and noise_strength is not None and noise_generator is not None:
             with torch.no_grad():
-                x_input = apply_fdia_noise(x_target, m, strength=float(noise_strength), generator=noise_generator, fraction=0.15)
+                x_input = apply_fdia_noise(
+                    x_target,
+                    m,
+                    strength=float(noise_strength),
+                    generator=noise_generator,
+                    fraction=noise_fraction_base,
+                    fraction_choices=noise_fractions,
+                )
 
         if train:
             assert optimizer is not None
@@ -91,7 +99,7 @@ def _run_epoch(
 class OnlineTrainer:
     def __init__(
         self,
-        model: OnlineGPVAE,
+        model: TCNVAE,
         optimizer: torch.optim.Optimizer,
         *,
         device: Optional[torch.device] = None,
@@ -99,6 +107,8 @@ class OnlineTrainer:
         beta: Optional[float] = None,
         noise_strength: Optional[float] = None,
         noise_seed: Optional[int] = None,
+        noise_fractions: Optional[Tuple[float, ...]] = None,
+        noise_fraction: float = 0.15,
     ) -> None:
         self.model = model
         self.optimizer = optimizer
@@ -107,6 +117,18 @@ class OnlineTrainer:
         self.beta = beta
         self.model.to(self.device)
         self.noise_strength = noise_strength
+        self.noise_fraction = float(noise_fraction)
+        self.noise_fractions_tensor: Optional[torch.Tensor]
+        self.noise_fractions_tensor = None
+        if noise_fractions:
+            vals = []
+            for f in noise_fractions:
+                fv = float(f)
+                if not (0.0 <= fv <= 1.0):
+                    raise ValueError('noise_fractions entries must lie within [0, 1]')
+                vals.append(fv)
+            if vals:
+                self.noise_fractions_tensor = torch.tensor(vals, dtype=torch.float32, device='cpu')
         # Use CPU generator for reproducibility; noise tensors will be moved to device
         if noise_seed is not None:
             g = torch.Generator(device='cpu')
@@ -114,9 +136,6 @@ class OnlineTrainer:
             self.noise_gen = g
         else:
             self.noise_gen = None
-
-    def _to_device(self, *tensors: torch.Tensor):
-        return tuple(t.to(self.device) for t in tensors)
 
     def train_epoch(self, loader: DataLoader) -> EpochStats:
         self.model.train()
@@ -130,6 +149,8 @@ class OnlineTrainer:
             train=True,
             noise_strength=self.noise_strength,
             noise_generator=self.noise_gen,
+            noise_fractions=self.noise_fractions_tensor,
+            noise_fraction_base=self.noise_fraction,
         )
 
     @torch.no_grad()
@@ -145,6 +166,8 @@ class OnlineTrainer:
             train=False,
             noise_strength=self.noise_strength,
             noise_generator=self.noise_gen,
+            noise_fractions=self.noise_fractions_tensor,
+            noise_fraction_base=self.noise_fraction,
         )
 
     # No legacy bulk-imputation APIs are provided.

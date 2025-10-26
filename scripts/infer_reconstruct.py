@@ -3,15 +3,15 @@ import numpy as np
 import pandas as pd
 import torch
 
-from gru_vae.config import load_config
-from gru_vae.data import (
+from tcn_vae.config import load_config
+from tcn_vae.data import (
     load_paired_timeseries,
     apply_standardization_slotwise,
     times_to_hour_index,
     masked_robust_slot_stats,
 )
-from gru_vae.model import OnlineGPVAE
-from gru_vae.utils import resolve_device
+from tcn_vae.model import TCNVAE
+from tcn_vae.utils import resolve_device
 
 
 def main() -> None:
@@ -44,18 +44,24 @@ def main() -> None:
     except TypeError:
         # Older PyTorch without weights_only: fallback to standard load
         ckpt = torch.load(args.ckpt, map_location='cpu')
-    # Minimal config: we must know latent and sizes; save them via training script
-    # Fallback to defaults if unavailable in checkpoint
+    # Minimal config: latent and TCN sizes; saved during training
     latent_dim = ckpt.get('latent_dim', getattr(args, 'latent_dim', 32))
-    gru_hidden = ckpt.get('gru_hidden', getattr(args, 'gru_hidden', 256))
-    gru_layers = ckpt.get('gru_layers', getattr(args, 'gru_layers', 1))
+    tcn_channels_str = ckpt.get('tcn_channels', getattr(args, 'tcn_channels', '256,256,256'))
+    if isinstance(tcn_channels_str, str):
+        tcn_channels = tuple(int(x) for x in tcn_channels_str.split(',') if x)
+    else:
+        # allow list from YAML
+        tcn_channels = tuple(int(x) for x in tcn_channels_str)
+    tcn_kernel_size = int(ckpt.get('tcn_kernel_size', getattr(args, 'tcn_kernel_size', 3)))
+    tcn_dropout = float(ckpt.get('tcn_dropout', getattr(args, 'tcn_dropout', 0.0)))
     dec_hidden = tuple(int(x) for x in str(getattr(args, 'dec_hidden', '256,256')).split(',') if x)
-    model = OnlineGPVAE(
+    model = TCNVAE(
         input_dim=H,
         output_dim=H,
         latent_dim=latent_dim,
-        enc_hidden_size=gru_hidden,
-        enc_layers=gru_layers,
+        tcn_channels=tcn_channels,
+        tcn_kernel_size=tcn_kernel_size,
+        tcn_dropout=tcn_dropout,
         dec_hidden=dec_hidden,
         beta=getattr(args, 'beta', 0.1),
         obs_init_logvar=getattr(args, 'obs_init_logvar', -3.5),
@@ -71,7 +77,7 @@ def main() -> None:
     x_in = torch.from_numpy(Xa_s).unsqueeze(0).to(device)
     m_in = torch.from_numpy(M).unsqueeze(0).to(device)
     with torch.no_grad():
-        y_pred_s = model.reconstruct_online(x_in, m_in, use_mean=True).squeeze(0).cpu().numpy().astype(np.float32)
+        y_pred_s = model.reconstruct(x_in, m_in, use_mean=True).squeeze(0).cpu().numpy().astype(np.float32)
 
     # Unstandardize to original scale
     mean_t = slot_mean[hours_all]

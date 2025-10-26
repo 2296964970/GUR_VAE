@@ -1,4 +1,4 @@
-"""Unified configuration loader for the GRU-VAE project.
+"""Unified configuration loader for the TCN-VAE project.
 
 This module loads a single YAML file (default: ``config.yaml`` at repo root),
 merges it with sensible defaults, performs minimal validation, and exposes
@@ -6,7 +6,7 @@ attributes expected by existing scripts so we can remove argparse everywhere.
 
 Usage
 -----
-from gru_vae.config import load_config
+from tcn_vae.config import load_config
 cfg = load_config()  # returns a SimpleNamespace with flat attributes
 
 By design, the returned object provides attributes matching the previous
@@ -15,7 +15,7 @@ command-line flags used by scripts, e.g., ``cfg.case``, ``cfg.data_dir``,
 
 Environment override
 --------------------
-If the environment variable ``GRUVAE_CONFIG`` is set to a path, it will be used
+If the environment variable ``TCNVAE_CONFIG`` is set to a path, it will be used
 instead of the default ``config.yaml`` at the project root.
 """
 
@@ -65,8 +65,9 @@ def _defaults() -> Dict[str, Any]:
         # Model
         'latent_dim': 32,
         'dec_hidden': '256,256',
-        'gru_hidden': 256,
-        'gru_layers': 1,
+        'tcn_channels': '256,256,256',
+        'tcn_kernel_size': 3,
+        'tcn_dropout': 0.0,
         'beta': 0.1,
         'obs_init_logvar': -3.5,
         # Train
@@ -74,10 +75,12 @@ def _defaults() -> Dict[str, Any]:
         'seed': 1337,
         'learning_rate': 3e-4,
         'grad_clip': 1e4,
-        'exp_name': 'gru_base_ep40',
+        'exp_name': 'tcn_base_ep40',
         'device': 'cpu',
         # Checkpoint
         'ckpt': '',
+        # Noise fractions (optional overrides for per-step attack rate)
+        'noise_fractions': '',
         # Inference window removed in simplified pipeline
         # Noise (FDIA injection for training/validation)
         'noise_strength': 0.5,
@@ -93,7 +96,7 @@ def _flatten_config(raw: Dict[str, Any]) -> Dict[str, Any]:
     - train: { normal_csv, attacked_csv, epochs, seed, learning_rate, grad_clip, exp_name, device }
     - infer: { normal_csv, attacked_csv }
     - window: { time_length, stride, batch_size, train_ratio, val_ratio }
-    - model: { latent_dim, dec_hidden, gru_hidden, gru_layers, beta, obs_init_logvar }
+    - model: { latent_dim, dec_hidden, tcn_channels, tcn_kernel_size, tcn_dropout, beta, obs_init_logvar }
     """
     d = _defaults()
 
@@ -117,6 +120,13 @@ def _flatten_config(raw: Dict[str, Any]) -> Dict[str, Any]:
     # Noise
     d['noise_strength'] = float(_deep_get(raw, 'noise.strength', d['noise_strength']))
     d['noise_seed'] = int(_deep_get(raw, 'noise.seed', d['noise_seed']))
+    noise_fractions = _deep_get(raw, 'noise.fractions', d['noise_fractions'])
+    if isinstance(noise_fractions, list):
+        d['noise_fractions'] = ','.join(str(float(x)) for x in noise_fractions)
+    elif noise_fractions in (None, ''):
+        d['noise_fractions'] = ''
+    else:
+        d['noise_fractions'] = str(noise_fractions)
 
     # Model
     # Allow dec_hidden as list[int] or comma string
@@ -126,8 +136,14 @@ def _flatten_config(raw: Dict[str, Any]) -> Dict[str, Any]:
     else:
         d['dec_hidden'] = str(dec_hidden)
     d['latent_dim'] = int(_deep_get(raw, 'model.latent_dim', d['latent_dim']))
-    d['gru_hidden'] = int(_deep_get(raw, 'model.gru_hidden', d['gru_hidden']))
-    d['gru_layers'] = int(_deep_get(raw, 'model.gru_layers', d['gru_layers']))
+    # TCN params
+    tcn_channels = _deep_get(raw, 'model.tcn_channels', d['tcn_channels'])
+    if isinstance(tcn_channels, list):
+        d['tcn_channels'] = ','.join(str(int(x)) for x in tcn_channels)
+    else:
+        d['tcn_channels'] = str(tcn_channels)
+    d['tcn_kernel_size'] = int(_deep_get(raw, 'model.tcn_kernel_size', d['tcn_kernel_size']))
+    d['tcn_dropout'] = float(_deep_get(raw, 'model.tcn_dropout', d['tcn_dropout']))
     d['beta'] = float(_deep_get(raw, 'model.beta', d['beta']))
     d['obs_init_logvar'] = float(_deep_get(raw, 'model.obs_init_logvar', d['obs_init_logvar']))
 
@@ -165,7 +181,7 @@ def _validate_training_policy(flat: Dict[str, Any]) -> None:
 
 def load_config(path: str | None = None) -> SimpleNamespace:
     """Load YAML configuration and return a SimpleNamespace with flat attributes."""
-    cfg_path = path or os.environ.get('GRUVAE_CONFIG') or 'config.yaml'
+    cfg_path = path or os.environ.get('TCNVAE_CONFIG') or 'config.yaml'
     if not os.path.exists(cfg_path):
         raise SystemExit(f"[error] Config file not found: {cfg_path}")
     with open(cfg_path, 'r', encoding='utf-8') as f:
