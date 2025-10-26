@@ -16,7 +16,7 @@ train:
 
 infer:
   normal_csv: input\case14\infer\case14_2025-09_clean_noisy.csv
-  attacked_csv: input/case14/infer/case14_fdia_2025-09_noisy.csv
+  attacked_csv: input\case14\infer\case14_attack_noisy_2025-09.csv
 
 # Windowing and batching
 window:
