@@ -65,6 +65,16 @@ def main() -> None:
     else:
         noise_fraction_tuple = tuple()
 
+    strengths_raw = getattr(args, 'noise_strengths', '')
+    if isinstance(strengths_raw, str):
+        cleaned_s = strengths_raw.replace('[', '').replace(']', '')
+        parts_s = [p.strip() for p in cleaned_s.split(',') if p.strip()]
+        noise_strength_tuple = tuple(float(p) for p in parts_s)
+    elif isinstance(strengths_raw, (list, tuple)):
+        noise_strength_tuple = tuple(float(p) for p in strengths_raw)
+    else:
+        noise_strength_tuple = tuple()
+
     trainer = OnlineTrainer(
         model,
         optimizer,
@@ -74,10 +84,11 @@ def main() -> None:
         noise_strength=getattr(args, 'noise_strength', 0.5),
         noise_seed=getattr(args, 'noise_seed', 1337),
         noise_fractions=noise_fraction_tuple,
+        noise_strengths=noise_strength_tuple,
     )
 
-    # Enforce output directory layout: output/<case>/models/<exp_name>
-    outdir = os.path.join('output', args.case, 'models', args.exp_name)
+    # Training output directory: <train_model_root>/<exp_name>
+    outdir = args.model_dir
     os.makedirs(outdir, exist_ok=True)
 
     train_curve = {'loss': [], 'val': []}

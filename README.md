@@ -1,4 +1,4 @@
-# TCN-VAE: Generative Reconstruction for FDIA
+﻿# TCN-VAE: Generative Reconstruction for FDIA
 
 End-to-end Temporal Convolutional Network Variational Autoencoder (TCN-VAE) for power-system measurement streams. The model learns nominal trajectories and reconstructs attacked inputs by aligning them with the paired normal sequence at the same timestamps, using observed-only losses.
 
@@ -31,7 +31,7 @@ End-to-end Temporal Convolutional Network Variational Autoencoder (TCN-VAE) for 
 - Row count: 17,857 rows per file (1 header + 17,856 time steps).
 
 - Data locations
-- Training (2025/07–08): under `input/{case}/train/`
+- Training (2025/07鈥?8): under `input/{case}/train/`
   - Normal CSV: `*_2025-07_2025-08_clean_noisy.csv` (used to fit and train with FDIA injection on-the-fly).
 - Inference (2025/09): under `input/{case}/infer/`
   - Paired CSVs: `*_2025-09_clean_noisy.csv` (normal) and `*_fdia_2025-09_noisy.csv` (attacked).
@@ -39,7 +39,7 @@ End-to-end Temporal Convolutional Network Variational Autoencoder (TCN-VAE) for 
 ---
 
 ## Training and Inference Policy (No Data Leakage)
-- Training uses 2025/07–08 normal CSV only; FDIA attacks are simulated by per-step sparse Gaussian injection in standardized domain.
+- Training uses 2025/07鈥?8 normal CSV only; FDIA attacks are simulated by per-step sparse Gaussian injection in standardized domain.
 - Training normal CSV must not contain `fdia` nor `2025-09`. Any `2025-09` path is forbidden in training configuration.
 - Standardization uses slot-wise robust (hour-of-day) statistics computed from the training normal split only and saved next to the checkpoint; these statistics are reused for inference (no re-fitting on 2025/09).
 
@@ -54,20 +54,20 @@ Observed-only reconstruction and masks
 
 During training and validation, False Data Injection Attacks (FDIA) are simulated on-the-fly in the standardized domain.
 
-- Notation: `x_target ∈ R^{B×T×H}` (standardized clean inputs), `m ∈ {0,1}^{B×T×H}` (observability mask).
+- Notation: `x_target 鈭?R^{B脳T脳H}` (standardized clean inputs), `m 鈭?{0,1}^{B脳T脳H}` (observability mask).
 - Per-step sparse attacks: for each batch `b` and time step `t`, pick a sparse subset of observed features to attack.
-- Attack rate: fixed fraction `q = 0.15` (no config switch). If no observed feature is selected, force-select `ceil(q · N_obs)` (or 1 if `N_obs > 0`). If `N_obs=0`, fall back to full domain (will be masked out by `m`).
-- Noise: i.i.d. Gaussian `ε ~ N(0, σ^2)` with `σ = noise.strength`.
+- Attack rate: fixed fraction `q = 0.15` (no config switch). If no observed feature is selected, force-select `ceil(q 路 N_obs)` (or 1 if `N_obs > 0`). If `N_obs=0`, fall back to full domain (will be masked out by `m`).
+- Noise: i.i.d. Gaussian `蔚 ~ N(0, 蟽^2)` with `蟽 = noise.strength`.
 
 Formula (elementwise Hadamard products):
 
 ```
-Given x_target, m, strength σ, rate q, for each (b, t):
+Given x_target, m, strength 蟽, rate q, for each (b, t):
   obs_idx = { j | m[b,t,j] = 1 }
   A[b,t,:] = 0
-  Sample S ⊆ obs_idx by Bernoulli(q); if S = ∅ and |obs_idx|>0, pick k=ceil(q·|obs_idx|) random indices; set A[b,t,S]=1
-  Sample ε[b,t,:] ~ Normal(0, σ^2 I)
-  x_input[b,t,:] = x_target[b,t,:] + ε[b,t,:] ⊙ A[b,t,:] ⊙ m[b,t,:]
+  Sample S 鈯?obs_idx by Bernoulli(q); if S = 鈭?and |obs_idx|>0, pick k=ceil(q路|obs_idx|) random indices; set A[b,t,S]=1
+  Sample 蔚[b,t,:] ~ Normal(0, 蟽^2 I)
+  x_input[b,t,:] = x_target[b,t,:] + 蔚[b,t,:] 鈯?A[b,t,:] 鈯?m[b,t,:]
 ```
 
 - The model receives `x_input` and is optimized to reconstruct `x_target` using observed-only Gaussian NLL + KL.
@@ -84,7 +84,7 @@ All parameters are configured in a single `config.yaml` at the project root.
 1) Configure
 - Edit `config.yaml` and set:
   - `global.case`, `global.data_dir`
-  - `train.normal_csv` (07–08)
+  - `train.normal_csv` (07鈥?8)
   - `noise.strength`, `noise.seed` (training-time FDIA injection)
   - `infer.normal_csv`, `infer.attacked_csv` (09)
   - `model`, `train`, `window`
@@ -112,7 +112,7 @@ Outputs are written under `output/<case>/infer/<exp_name>/`:
 - Prior: AR(1) state-space model with optional low-rank noise.
 - Decoder: MLP outputs per-step Gaussian mean and log-variance.
 - Training objective: observed-only Gaussian NLL + KL regularization (with warm-up).
-  - KL warm-up: linear 0 → `beta` during the first ~20% of epochs; always enabled (no configuration switch).
+  - KL warm-up: linear 0 鈫?`beta` during the first ~20% of epochs; always enabled (no configuration switch).
 
 ---
 
@@ -132,7 +132,7 @@ Outputs are written under `output/<case>/infer/<exp_name>/`:
 - Full-series reconstruction: the script standardizes the entire 2025/09 attacked series, runs causal reconstruction, and unstandardizes to original scale.
 - No window/MC: window selection and MC averaging are removed to keep the pipeline minimal.
 - No passthrough of observed inputs: reconstructed values are model predictions at all positions.
-- Standardization: uses slot-wise robust (hour-of-day) statistics computed from 2025/07–08 normal training split; no re-fitting on 2025/09.
+- Standardization: uses slot-wise robust (hour-of-day) statistics computed from 2025/07鈥?8 normal training split; no re-fitting on 2025/09.
 - Terminal summary: prints Top-10 and Worst-10 timestamps by MSE repair effect (att - rep) on observed positions only.
 
 ## Configuration Notes

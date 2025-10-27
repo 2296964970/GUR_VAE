@@ -4,18 +4,18 @@ global:
 
 # Paired data paths (explicit)
 train:
-  normal_csv: input/case14/train/case14_2025-07_2025-08_clean_noisy.csv
+  normal_csv: input\case14\train\case14_normal_noisy_2025-07_2025-08.csv
   epochs: 40
   seed: 1337
   learning_rate: 0.0003
   grad_clip: 10000.0
-  exp_name: tcn_base_ep40
   device: cpu         # cpu | cuda
-  ckpt: output/case14/models/tcn_base_ep40/ckpt.pt
+  model_dir: output/case14/models/tcn_base_ep40
 
 infer:
-  normal_csv: input\case14\infer\case14_2025-09_clean_noisy.csv
+  normal_csv: input\case14\infer\case14_normal_noisy_2025-09.csv
   attacked_csv: input\case14\infer\case14_attack_noisy_2025-09.csv
+  ckpt: output/case14/models/tcn_base_ep40/ckpt.pt
 
 # Windowing and batching
 window:
@@ -27,9 +27,9 @@ window:
 
 # FDIA noise injection (training/validation)
 noise:
-  strength: 0.5
+  strengths: [0.05, 0.1, 0.3, 0.5, 0.7, 1.0, 1.5]
   seed: 1337
-  fractions: [0.1, 0.05, 0.02, 0.15, 0.3, 0.4]
+  fractions: [0,0.01,0.02,0.05,0.1,0.15]
 
 # Model hyperparameters
 model:

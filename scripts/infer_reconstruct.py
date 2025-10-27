@@ -19,10 +19,12 @@ def main() -> None:
     device = resolve_device(args.device)
 
     # Paths
-    outdir = os.path.join('output', args.case, 'infer', args.exp_name)
+    # Derive experiment name from checkpoint directory to avoid relying on missing args.exp_name
+    model_dir = os.path.dirname(args.ckpt)
+    exp_name = os.path.basename(model_dir) if model_dir else 'default'
+    outdir = os.path.join('output', args.case, 'infer', exp_name)
     os.makedirs(outdir, exist_ok=True)
     # Load stats from training
-    model_dir = os.path.dirname(args.ckpt)
     stats_path = os.path.join(model_dir, 'slot_stats.npz')
     if not os.path.exists(stats_path):
         raise SystemExit('[error] slot_stats.npz not found next to checkpoint; run training first')

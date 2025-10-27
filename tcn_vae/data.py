@@ -10,9 +10,11 @@ from torch.utils.data import Dataset, DataLoader
 
 
 def _load_csv(path: str) -> pd.DataFrame:
-    if not os.path.exists(path):
+    # Normalize Windows-style backslashes to the current OS separator for portability
+    norm_path = path.replace('\\', os.sep)
+    if not os.path.exists(norm_path):
         raise FileNotFoundError(path)
-    df = pd.read_csv(path)
+    df = pd.read_csv(norm_path)
     if df.shape[1] < 2:
         raise ValueError('CSV must have at least a timestamp column and one feature')
     return df

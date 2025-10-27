@@ -75,16 +75,16 @@ def _defaults() -> Dict[str, Any]:
         'seed': 1337,
         'learning_rate': 3e-4,
         'grad_clip': 1e4,
-        'exp_name': 'tcn_base_ep40',
+        'model_dir': '',
         'device': 'cpu',
         # Checkpoint
-        'ckpt': '',
-        # Noise fractions (optional overrides for per-step attack rate)
+        'ckpt': '',        # Noise fractions (optional overrides for per-step attack rate)
         'noise_fractions': '',
         # Inference window removed in simplified pipeline
         # Noise (FDIA injection for training/validation)
         'noise_strength': 0.5,
         'noise_seed': 1337,
+        'noise_strengths': '',
     }
 
 
@@ -103,6 +103,8 @@ def _flatten_config(raw: Dict[str, Any]) -> Dict[str, Any]:
     # Global
     d['data_dir'] = _deep_get(raw, 'global.data_dir', d['data_dir'])
     d['case'] = _deep_get(raw, 'global.case', d['case'])
+    # Single model directory (Plan A). Default to output/<case>/models
+    d['model_dir'] = str(_deep_get(raw, 'train.model_dir', os.path.join('output', d['case'], 'models')))
 
     # CSV paths
     d['train_normal_csv'] = _deep_get(raw, 'train.normal_csv', d['train_normal_csv'])
@@ -127,6 +129,14 @@ def _flatten_config(raw: Dict[str, Any]) -> Dict[str, Any]:
         d['noise_fractions'] = ''
     else:
         d['noise_fractions'] = str(noise_fractions)
+    # Optional strength choices
+    noise_strengths = _deep_get(raw, 'noise.strengths', d.get('noise_strengths', ''))
+    if isinstance(noise_strengths, list):
+        d['noise_strengths'] = ','.join(str(float(x)) for x in noise_strengths)
+    elif noise_strengths in (None, ''):
+        d['noise_strengths'] = ''
+    else:
+        d['noise_strengths'] = str(noise_strengths)
 
     # Model
     # Allow dec_hidden as list[int] or comma string
@@ -152,15 +162,14 @@ def _flatten_config(raw: Dict[str, Any]) -> Dict[str, Any]:
     d['seed'] = int(_deep_get(raw, 'train.seed', d['seed']))
     d['learning_rate'] = float(_deep_get(raw, 'train.learning_rate', d['learning_rate']))
     d['grad_clip'] = float(_deep_get(raw, 'train.grad_clip', d['grad_clip']))
-    d['exp_name'] = str(_deep_get(raw, 'train.exp_name', d['exp_name']))
     d['device'] = str(_deep_get(raw, 'train.device', d['device']))
 
-    # No tail-only or MATLAB sections in pared-down config
-    d['ckpt'] = str(_deep_get(raw, 'train.ckpt', d['ckpt']))
-
-    # If ckpt is empty, derive from exp_name
-    if not d.get('ckpt'):
-        d['ckpt'] = os.path.join('output', d['case'], 'models', d['exp_name'], 'ckpt.pt')
+    # Effective checkpoint resolution (Plan A)
+    # - Train ckpt: derived from model_dir/ckpt.pt
+    # - Infer ckpt: infer.ckpt; if empty, fall back to train ckpt
+    train_ckpt = os.path.join(d['model_dir'], 'ckpt.pt')
+    infer_ckpt = str(_deep_get(raw, 'infer.ckpt', ''))
+    d['ckpt'] = infer_ckpt if infer_ckpt else train_ckpt
 
     return d
 

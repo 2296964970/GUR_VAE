@@ -45,20 +45,25 @@ def apply_fdia_noise(
     generator: torch.Generator,
     fraction: float = 0.15,
     fraction_choices: torch.Tensor | None = None,
+    strength_choices: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Apply FDIA-like sparse Gaussian noise per time step on observed features.
 
     - x: standardized input [B,T,H]
     - mask: observability mask [B,T,H] (1 observed, 0 missing)
-    - strength: stddev of Gaussian noise in standardized domain
+    - strength: base stddev of Gaussian noise in standardized domain
     - generator: RNG for reproducibility (CPU generator is acceptable; noise will be moved to device)
     - fraction: per-step feature fraction to attack (constant, not exposed to config)
     - fraction_choices: optional tensor of candidate per-step fractions; when provided,
       a value is sampled (with replacement) for each (batch, time) pair.
+    - strength_choices: optional tensor of candidate per-step noise stddev values (non-negative);
+      when provided, a value is sampled (with replacement) per (batch, time).
 
     For each batch b and time t, sample an attack subset over observed features with Bernoulli(fraction).
     If no observed feature is selected, force-select ceil(fraction * N_obs) random observed features (or 1 if N_obs>0).
-    Noise is added only on attacked observed positions.
+    
+    Strength sampling (default randomized): if no strength_choices are provided, the per-step
+    strength is sampled from a uniform window around the base strength: U[0.5*strength, 1.5*strength].
     """
     if x.shape != mask.shape:
         raise ValueError('x and mask must share shape [B,T,H]')
@@ -73,6 +78,15 @@ def apply_fdia_noise(
             if (fraction_choices < 0.0).any() or (fraction_choices > 1.0).any():
                 raise ValueError('fraction_choices values must lie within [0, 1]')
             fraction_choices = fraction_choices.to(dtype=torch.float32, device='cpu')
+    if strength_choices is not None:
+        if strength_choices.ndim != 1:
+            raise ValueError('strength_choices must be a 1D tensor if provided')
+        if strength_choices.numel() == 0:
+            strength_choices = None
+        else:
+            if (strength_choices < 0.0).any():
+                raise ValueError('strength_choices values must be non-negative')
+            strength_choices = strength_choices.to(dtype=torch.float32, device='cpu')
     B, T, H = x.shape
     device = x.device
     dtype = x.dtype
@@ -94,6 +108,20 @@ def apply_fdia_noise(
                 ).item()
                 frac_bt = float(fraction_choices[choice_idx].item())
                 frac_bt = max(0.0, min(1.0, frac_bt))
+            # Determine per-(b,t) noise strength
+            if strength_choices is not None:
+                s_idx = torch.randint(
+                    low=0,
+                    high=strength_choices.numel(),
+                    size=(1,),
+                    generator=generator,
+                    dtype=torch.int64,
+                ).item()
+                strength_bt = max(0.0, float(strength_choices[s_idx].item()))
+            else:
+                # Default: sample around base strength using U[0.5*strength, 1.5*strength]
+                scale = 0.5 + torch.rand((), generator=generator, dtype=dtype).item()
+                strength_bt = max(0.0, float(strength) * scale)
             obs_idx = (m_cpu[b, t, :] > 0.5).nonzero(as_tuple=False).flatten()
             n_obs = int(obs_idx.numel())
             if n_obs == 0:
@@ -104,8 +132,8 @@ def apply_fdia_noise(
             perm = torch.randperm(n_obs, generator=generator)
             sel_idx = obs_idx[perm[:cluster_size]]
             # Generate a coordinated shift shared across the attacked subset
-            shared_shift = torch.randn((), generator=generator, dtype=dtype) * strength
-            small_jitter = torch.randn(cluster_size, generator=generator, dtype=dtype) * (0.1 * strength)
+            shared_shift = torch.randn((), generator=generator, dtype=dtype) * strength_bt
+            small_jitter = torch.randn(cluster_size, generator=generator, dtype=dtype) * (0.1 * strength_bt)
             attack_values = shared_shift + small_jitter
             out_cpu[b, t, sel_idx] = x_cpu[b, t, sel_idx] + attack_values
     return out_cpu.to(device=device)

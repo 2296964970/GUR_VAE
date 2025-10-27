@@ -31,6 +31,7 @@ def _run_epoch(
     noise_strength: Optional[float] = None,
     noise_generator: Optional[torch.Generator] = None,
     noise_fractions: Optional[torch.Tensor] = None,
+    noise_strength_choices: Optional[torch.Tensor] = None,
     noise_fraction_base: float = 0.15,
 ) -> EpochStats:
     if train and optimizer is None:
@@ -62,6 +63,7 @@ def _run_epoch(
                     generator=noise_generator,
                     fraction=noise_fraction_base,
                     fraction_choices=noise_fractions,
+                    strength_choices=noise_strength_choices,
                 )
 
         if train:
@@ -108,6 +110,7 @@ class OnlineTrainer:
         noise_strength: Optional[float] = None,
         noise_seed: Optional[int] = None,
         noise_fractions: Optional[Tuple[float, ...]] = None,
+        noise_strengths: Optional[Tuple[float, ...]] = None,
         noise_fraction: float = 0.15,
     ) -> None:
         self.model = model
@@ -129,6 +132,18 @@ class OnlineTrainer:
                 vals.append(fv)
             if vals:
                 self.noise_fractions_tensor = torch.tensor(vals, dtype=torch.float32, device='cpu')
+        # Optional per-step strength choices (non-negative)
+        self.noise_strengths_tensor: Optional[torch.Tensor]
+        self.noise_strengths_tensor = None
+        if noise_strengths:
+            svals = []
+            for s in noise_strengths:
+                sv = float(s)
+                if sv < 0.0:
+                    raise ValueError('noise_strengths entries must be non-negative')
+                svals.append(sv)
+            if svals:
+                self.noise_strengths_tensor = torch.tensor(svals, dtype=torch.float32, device='cpu')
         # Use CPU generator for reproducibility; noise tensors will be moved to device
         if noise_seed is not None:
             g = torch.Generator(device='cpu')
@@ -150,6 +165,7 @@ class OnlineTrainer:
             noise_strength=self.noise_strength,
             noise_generator=self.noise_gen,
             noise_fractions=self.noise_fractions_tensor,
+            noise_strength_choices=self.noise_strengths_tensor,
             noise_fraction_base=self.noise_fraction,
         )
 
@@ -167,6 +183,7 @@ class OnlineTrainer:
             noise_strength=self.noise_strength,
             noise_generator=self.noise_gen,
             noise_fractions=self.noise_fractions_tensor,
+            noise_strength_choices=self.noise_strengths_tensor,
             noise_fraction_base=self.noise_fraction,
         )
 
