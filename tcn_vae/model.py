@@ -37,6 +37,19 @@ class TCNVAE(nn.Module):
         dec_hidden: Tuple[int, ...] = (256, 256),
         beta: float = 1.0,
         obs_init_logvar: float = -2.0,
+        # Encoder/decoder fine controls
+        enc_diag_eps: float = 1e-4,
+        dec_eps: float = 1e-6,
+        dec_logvar_min: float = -5.0,
+        dec_logvar_max: float = 2.302585092994046,
+        # Prior controls
+        prior_rank: int = 4,
+        prior_a_init: float = 0.95,
+        prior_q_init: float = 0.1,
+        prior_m0_init: float = 0.0,
+        prior_P0_init: float = 1.0,
+        prior_jitter: float = 1e-6,
+        prior_variance_floor: float = 1e-6,
     ) -> None:
         super().__init__()
         if input_dim <= 0 or output_dim <= 0 or latent_dim <= 0:
@@ -55,14 +68,28 @@ class TCNVAE(nn.Module):
             channels=tcn_channels,
             kernel_size=tcn_kernel_size,
             dropout=tcn_dropout,
+            diag_eps=float(enc_diag_eps),
         )
         self.decoder = GaussianDecoder(
             output_dim=self.output_dim,
             z_size=self.latent_dim,
             hidden_sizes=dec_hidden,
             init_logvar=obs_init_logvar,
+            eps=float(dec_eps),
+            logvar_min=float(dec_logvar_min),
+            logvar_max=float(dec_logvar_max),
         )
-        self.prior = SSMPrior(latent_dim=self.latent_dim)
+        self.prior = SSMPrior(
+            latent_dim=self.latent_dim,
+            a_init=float(prior_a_init),
+            q_init=float(prior_q_init),
+            m0_init=float(prior_m0_init),
+            P0_init=float(prior_P0_init),
+            rank=int(prior_rank),
+        )
+        # Override numerical floors if provided
+        self.prior.jitter = float(prior_jitter)
+        self.prior.variance_floor = float(prior_variance_floor)
 
     def _reparameterize(self, mu: torch.Tensor, chol: torch.Tensor) -> torch.Tensor:
         if mu.ndim != 3:
@@ -169,12 +196,21 @@ class TCNVAE(nn.Module):
         }
 
     @torch.no_grad()
-    def reconstruct(self, x: torch.Tensor, mask: torch.Tensor, use_mean: bool = True) -> torch.Tensor:
+    def reconstruct(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor,
+        use_mean: bool = True,
+        *,
+        return_logvar: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if x.ndim != 3 or mask.ndim != 3 or x.shape != mask.shape:
             raise ValueError('x and mask must have shape [B,T,H] and match')
         mu, chol = self._encode(x, mask)
         z = mu if use_mean else self._reparameterize(mu, chol)
-        mean_seq, _logvar_x = self.decoder(z)
+        mean_seq, logvar_x = self.decoder(z)
+        if return_logvar:
+            return mean_seq, logvar_x
         return mean_seq
 
 

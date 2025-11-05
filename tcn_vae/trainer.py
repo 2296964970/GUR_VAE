@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Sequence
 
 import torch
 from torch.utils.data import DataLoader
 
 from .model import TCNVAE
 from .metrics import batch_metrics
-from .utils import apply_fdia_noise
+from .utils import apply_segment_laplace_attacks
 
 
 @dataclass
@@ -28,11 +28,16 @@ def _run_epoch(
     grad_clip: float,
     beta: Optional[float],
     train: bool,
-    noise_strength: Optional[float] = None,
-    noise_generator: Optional[torch.Generator] = None,
-    noise_fractions: Optional[torch.Tensor] = None,
-    noise_strength_choices: Optional[torch.Tensor] = None,
-    noise_fraction_base: float = 0.15,
+    # Robust phase controls (None => identity phase)
+    robust: bool = False,
+    anchor_lambda: float = 1.0,
+    clean_fraction: float = 0.4,
+    seg_len_min: int = 8,
+    seg_len_max: int = 96,
+    dims_fraction_min: float = 0.05,
+    dims_fraction_max: float = 0.3,
+    laplace_scales: Optional[Sequence[float]] = None,
+    rng: Optional[torch.Generator] = None,
 ) -> EpochStats:
     if train and optimizer is None:
         raise ValueError('optimizer must be provided when train=True')
@@ -42,35 +47,43 @@ def _run_epoch(
     total_mse_obs = torch.zeros_like(total_loss)
     num_batches = 0
     for batch in loader:
-        if len(batch) == 3:
-            x_input, m, x_target = batch
-        elif len(batch) == 2:
-            x_input, m = batch
-            x_target = x_input
-        else:
-            raise ValueError('Expected batch of 2 or 3 tensors')
-        x_input = x_input.float().to(device)
+        # Training strictly supports normal-only batches: (x_normal, mask).
+        if len(batch) != 2:
+            raise ValueError('Expected batch of 2 tensors: (x_normal, mask)')
+        x, m = batch
+        x_target = x.float().to(device)
         m = m.float().to(device)
-        x_target = x_target.float().to(device)
-
-        # FDIA injection: only when dataset provides (x, m) i.e., two-tensor batches
-        if len(batch) == 2 and noise_strength is not None and noise_generator is not None:
+        if robust:
+            if rng is None:
+                raise ValueError('rng must be provided for robust training')
             with torch.no_grad():
-                x_input = apply_fdia_noise(
+                x_input, a_mask = apply_segment_laplace_attacks(
                     x_target,
                     m,
-                    strength=float(noise_strength),
-                    generator=noise_generator,
-                    fraction=noise_fraction_base,
-                    fraction_choices=noise_fractions,
-                    strength_choices=noise_strength_choices,
+                    generator=rng,
+                    clean_fraction=float(clean_fraction),
+                    seg_len_min=int(seg_len_min),
+                    seg_len_max=int(seg_len_max),
+                    dims_fraction_min=float(dims_fraction_min),
+                    dims_fraction_max=float(dims_fraction_max),
+                    laplace_scales=tuple(laplace_scales) if laplace_scales else (0.5, 1.0),
                 )
+        else:
+            x_input = x_target
+            a_mask = torch.zeros_like(x_target)
 
         if train:
             assert optimizer is not None
             optimizer.zero_grad(set_to_none=True)
             out = model.elbo_sequence_supervised(x_input, m, x_target, beta=beta)
             loss = out['loss']
+            if robust:
+                # Anchor loss on non-attacked observed positions only
+                with torch.no_grad():
+                    keep_mask = (1.0 - a_mask).clamp(min=0.0, max=1.0) * m
+                    denom = keep_mask.sum().clamp_min(1.0)
+                anchor = ((out['mean'] - x_target) ** 2 * keep_mask).sum() / denom
+                loss = loss + float(anchor_lambda) * anchor
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
@@ -99,6 +112,8 @@ def _run_epoch(
 
 
 class OnlineTrainer:
+    """Two-phase trainer with optional robust phase using Laplace segment attacks and anchor loss."""
+
     def __init__(
         self,
         model: TCNVAE,
@@ -107,11 +122,15 @@ class OnlineTrainer:
         device: Optional[torch.device] = None,
         grad_clip: float = 1e4,
         beta: Optional[float] = None,
-        noise_strength: Optional[float] = None,
-        noise_seed: Optional[int] = None,
-        noise_fractions: Optional[Tuple[float, ...]] = None,
-        noise_strengths: Optional[Tuple[float, ...]] = None,
-        noise_fraction: float = 0.15,
+        # Robust phase params
+        anchor_lambda: float = 1.0,
+        clean_fraction: float = 0.4,
+        seg_len_min: int = 8,
+        seg_len_max: int = 96,
+        dims_fraction_min: float = 0.05,
+        dims_fraction_max: float = 0.3,
+        laplace_scales: Optional[Tuple[float, ...]] = None,
+        rng_seed: Optional[int] = 1337,
     ) -> None:
         self.model = model
         self.optimizer = optimizer
@@ -119,40 +138,23 @@ class OnlineTrainer:
         self.grad_clip = float(grad_clip)
         self.beta = beta
         self.model.to(self.device)
-        self.noise_strength = noise_strength
-        self.noise_fraction = float(noise_fraction)
-        self.noise_fractions_tensor: Optional[torch.Tensor]
-        self.noise_fractions_tensor = None
-        if noise_fractions:
-            vals = []
-            for f in noise_fractions:
-                fv = float(f)
-                if not (0.0 <= fv <= 1.0):
-                    raise ValueError('noise_fractions entries must lie within [0, 1]')
-                vals.append(fv)
-            if vals:
-                self.noise_fractions_tensor = torch.tensor(vals, dtype=torch.float32, device='cpu')
-        # Optional per-step strength choices (non-negative)
-        self.noise_strengths_tensor: Optional[torch.Tensor]
-        self.noise_strengths_tensor = None
-        if noise_strengths:
-            svals = []
-            for s in noise_strengths:
-                sv = float(s)
-                if sv < 0.0:
-                    raise ValueError('noise_strengths entries must be non-negative')
-                svals.append(sv)
-            if svals:
-                self.noise_strengths_tensor = torch.tensor(svals, dtype=torch.float32, device='cpu')
-        # Use CPU generator for reproducibility; noise tensors will be moved to device
-        if noise_seed is not None:
+        # Robust controls
+        self.anchor_lambda = float(anchor_lambda)
+        self.clean_fraction = float(clean_fraction)
+        self.seg_len_min = int(seg_len_min)
+        self.seg_len_max = int(seg_len_max)
+        self.dims_fraction_min = float(dims_fraction_min)
+        self.dims_fraction_max = float(dims_fraction_max)
+        self.laplace_scales = tuple(laplace_scales) if laplace_scales else (0.1, 0.3, 0.7, 1.2)
+        # RNG (CPU) for deterministic augmentation
+        if rng_seed is not None:
             g = torch.Generator(device='cpu')
-            g.manual_seed(int(noise_seed))
-            self.noise_gen = g
+            g.manual_seed(int(rng_seed))
+            self.rng = g
         else:
-            self.noise_gen = None
+            self.rng = torch.Generator(device='cpu')
 
-    def train_epoch(self, loader: DataLoader) -> EpochStats:
+    def train_epoch(self, loader: DataLoader, *, robust: bool = False) -> EpochStats:
         self.model.train()
         return _run_epoch(
             model=self.model,
@@ -162,16 +164,21 @@ class OnlineTrainer:
             grad_clip=self.grad_clip,
             beta=self.beta,
             train=True,
-            noise_strength=self.noise_strength,
-            noise_generator=self.noise_gen,
-            noise_fractions=self.noise_fractions_tensor,
-            noise_strength_choices=self.noise_strengths_tensor,
-            noise_fraction_base=self.noise_fraction,
+            robust=robust,
+            anchor_lambda=self.anchor_lambda,
+            clean_fraction=self.clean_fraction,
+            seg_len_min=self.seg_len_min,
+            seg_len_max=self.seg_len_max,
+            dims_fraction_min=self.dims_fraction_min,
+            dims_fraction_max=self.dims_fraction_max,
+            laplace_scales=self.laplace_scales,
+            rng=self.rng,
         )
 
     @torch.no_grad()
     def evaluate(self, loader: DataLoader) -> EpochStats:
         self.model.eval()
+        # Validation always runs without synthetic attacks
         return _run_epoch(
             model=self.model,
             loader=loader,
@@ -180,11 +187,15 @@ class OnlineTrainer:
             grad_clip=self.grad_clip,
             beta=self.beta,
             train=False,
-            noise_strength=self.noise_strength,
-            noise_generator=self.noise_gen,
-            noise_fractions=self.noise_fractions_tensor,
-            noise_strength_choices=self.noise_strengths_tensor,
-            noise_fraction_base=self.noise_fraction,
+            robust=False,
+            anchor_lambda=self.anchor_lambda,
+            clean_fraction=self.clean_fraction,
+            seg_len_min=self.seg_len_min,
+            seg_len_max=self.seg_len_max,
+            dims_fraction_min=self.dims_fraction_min,
+            dims_fraction_max=self.dims_fraction_max,
+            laplace_scales=self.laplace_scales,
+            rng=self.rng,
         )
 
     # No legacy bulk-imputation APIs are provided.

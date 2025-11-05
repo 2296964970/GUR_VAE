@@ -28,6 +28,8 @@ class GaussianDecoder(nn.Module):
         init_logvar: float = -2.0,
         output_activation: Optional[nn.Module] = None,
         eps: float = 1e-6,
+        logvar_min: float = -5.0,
+        logvar_max: float = 2.302585092994046,
     ) -> None:
         super().__init__()
         if output_dim <= 0:
@@ -39,6 +41,8 @@ class GaussianDecoder(nn.Module):
         self.hidden_sizes = tuple(int(h) for h in hidden_sizes)
         self.output_activation = output_activation
         self.eps = float(eps)
+        self.logvar_min = float(logvar_min)
+        self.logvar_max = float(logvar_max)
 
         layers = []
         in_f = self.z_size
@@ -67,22 +71,17 @@ class GaussianDecoder(nn.Module):
             raise ValueError('z.shape[1] does not match z_size')
         z_bt_z = z.transpose(1, 2).contiguous()  # [B,T,Z]
         y = self.net(z_bt_z.view(B * T, Z))  # [B*T, 2H]
-        if self.output_activation is not None:
-            # Apply optional activation to the mean part only after split
-            pass
         y = y.view(B, T, 2 * self.output_dim)
         mean_raw, raw = torch.split(y, self.output_dim, dim=-1)
         if self.output_activation is not None:
             mean = self.output_activation(mean_raw)
         else:
             mean = mean_raw
-        # logvar = log(softplus(raw) + eps), then clamp to prevent variance blow-up
+        # logvar = log(softplus(raw) + eps), then clamp to prevent under/over-confidence
         logvar = torch.log(F.softplus(raw) + self.eps)
-        # Hard upper bound on log-variance: ~ log(10.0)
-        LOGVAR_MAX = 2.302585092994046
-        logvar = torch.clamp(logvar, max=LOGVAR_MAX)
+        # Bounds on log-variance to keep decoder uncertainty reasonable
+        logvar = torch.clamp(logvar, min=self.logvar_min, max=self.logvar_max)
         return mean, logvar
 
 
 __all__ = ['GaussianDecoder']
-

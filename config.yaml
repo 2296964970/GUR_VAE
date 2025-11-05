@@ -1,21 +1,37 @@
 # Global dataset selection
 global:
-  case: case14
+  case: case118
 
 # Paired data paths (explicit)
 train:
-  normal_csv: input\case14\train\case14_normal_noisy_2025-07_2025-08.csv
+  normal_csv: input\case118\train\case118_normal_noisy_2025-07-08.csv
   epochs: 40
+  # Two-phase schedule
+  phase1_epochs: 10    # identity pretraining (ELBO only)
+  phase2_epochs: 30    # robust training (Laplace segments + anchor)
+  anchor_lambda: 1.0   # anchor strength on non-attacked observed positions
   seed: 1337
   learning_rate: 0.0003
   grad_clip: 10000.0
-  device: cpu         # cpu | cuda
-  model_dir: output/case14/models/tcn_base_ep40
+  device: cuda         # cpu | cuda
+  model_dir: output/case118/models/tcn_base_ep118
+  # KL warmup fraction of epochs
+  warmup_frac: 0.2
 
 infer:
-  normal_csv: input\case14\infer\case14_normal_noisy_2025-09.csv
-  attacked_csv: input\case14\infer\case14_attack_noisy_2025-09.csv
-  ckpt: output/case14/models/tcn_base_ep40/ckpt.pt
+  normal_csv: input\case118\infer\case118_normal_noisy_2025-09.csv
+  attacked_csv: input\case118\infer\case118_attack_noisy_2025-09.csv
+  ckpt: output\case118\models\tcn_base_ep118_p1-15_p2-45_al-1.5_cf-0.5_seg-8-96_df-0.05-0.30_seed-1337_20251105-1530\ckpt.pt
+  # Blending controls for confidence-guided repair
+  blend_k_sigma: 1.0
+  blend_softness: 0.5
+
+# Preprocess / standardization
+preprocess:
+  # Clip standardized values to [-clip_k, clip_k] before masking; 0.0 disables clipping
+  clip_k: 3.0
+  # Floor for robust std when computing slot-wise stats to avoid division by near-zero
+  std_floor: 0.005
 
 # Windowing and batching
 window:
@@ -24,12 +40,18 @@ window:
   batch_size: 64
   train_ratio: 0.7
   val_ratio: 0.15
+  num_workers: 0
 
-# FDIA noise injection (training/validation)
-noise:
-  strengths: [0.05, 0.1, 0.3, 0.5, 0.7, 1.0, 1.5]
-  seed: 1337
-  fractions: [0,0.01,0.02,0.05,0.1,0.15]
+# Robust training controls (Phase-2 only)
+robust:
+  # Keep this fraction of batch windows completely clean (no synthetic attack)
+  clean_fraction: 0.4
+  # Single attacked segment length (min,max) in timesteps within a window
+  seg_len: [8, 96]
+  # Attack a fraction (min,max) of feature dimensions during the segment
+  dims_fraction: [0.05, 0.30]
+  # Laplace scale choices b for heavy-tailed offsets (standardized domain)
+  laplace_scales: [0.1, 0.3, 0.7, 1.2]
 
 # Model hyperparameters
 model:
@@ -38,5 +60,22 @@ model:
   tcn_channels: "256,256,256,256,256"  # 5 layers: receptive field ~125 steps
   tcn_kernel_size: 3
   tcn_dropout: 0.0
-  beta: 0.1
+  beta: 0.5
   obs_init_logvar: -3.5
+  encoder:
+    # Positive diagonal stabilizer for Cholesky factors from encoder
+    diag_eps: 0.0001
+  decoder:
+    # Numerical epsilon for softplus/log operations
+    eps: 1.0e-6
+    # Clamp bounds on decoded log-variance
+    logvar_min: -5.0
+    logvar_max: 2.302585092994046
+  prior:
+    rank: 4
+    a_init: 0.95
+    q_init: 0.1
+    m0_init: 0.0
+    P0_init: 1.0
+    jitter: 1.0e-6
+    variance_floor: 1.0e-6

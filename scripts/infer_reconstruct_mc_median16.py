@@ -14,16 +14,35 @@ from tcn_vae.model import TCNVAE
 from tcn_vae.utils import resolve_device
 
 
+def mc_median_reconstruct(
+    model: TCNVAE,
+    x_in: torch.Tensor,
+    m_in: torch.Tensor,
+    *,
+    samples: int = 16,
+) -> np.ndarray:
+    """Return MC-median predictions (standardized domain) with no blending.
+
+    Inputs x_in/m_in are tensors of shape [1, T, H]. Returns a numpy array [T, H].
+    """
+    preds = []
+    with torch.no_grad():
+        for _ in range(int(samples)):
+            y_s = model.reconstruct(x_in, m_in, use_mean=False)  # [1,T,H]
+            preds.append(y_s)
+    y_stack = torch.stack(preds, dim=0)  # [K,1,T,H]
+    y_med = torch.median(y_stack, dim=0).values.squeeze(0)  # [T,H]
+    return y_med.detach().cpu().numpy().astype(np.float32)
+
+
 def main() -> None:
     args = load_config()
     device = resolve_device(args.device)
 
-    # Paths
-    # Derive experiment name from checkpoint directory to avoid relying on missing args.exp_name
+    # Derive experiment name from checkpoint directory to keep output/log style aligned
     model_dir = os.path.dirname(args.ckpt)
     exp_name = os.path.basename(model_dir) if model_dir else 'default'
-    outdir = os.path.join('output', args.case, 'infer', exp_name)
-    os.makedirs(outdir, exist_ok=True)
+
     # Load stats from training
     stats_path = os.path.join(model_dir, 'slot_stats.npz')
     if not os.path.exists(stats_path):
@@ -31,33 +50,26 @@ def main() -> None:
     stats = np.load(stats_path, allow_pickle=True)
     slot_mean = stats['mean']  # [S,H]
     slot_std = stats['std']    # [S,H]
-    # Optional metadata
     clip_k = float(stats['clip_k']) if 'clip_k' in stats else 5.0
 
-    # Data: infer paired (full series)
+    # Data: paired (full series)
     Xa, Xn, M, ts = load_paired_timeseries(args.infer_normal_csv, args.infer_attacked_csv)
 
     # Model
-    # Infer H from data
     H = Xa.shape[1]
-    # Safe load: prefer weights_only=True to avoid arbitrary code execution via pickle
     try:
         ckpt = torch.load(args.ckpt, map_location='cpu', weights_only=True)  # type: ignore[call-arg]
     except TypeError:
-        # Older PyTorch without weights_only: fallback to standard load
         ckpt = torch.load(args.ckpt, map_location='cpu')
-    # Minimal config: latent and TCN sizes; saved during training
     latent_dim = ckpt.get('latent_dim', getattr(args, 'latent_dim', 32))
     tcn_channels_str = ckpt.get('tcn_channels', getattr(args, 'tcn_channels', '256,256,256'))
     if isinstance(tcn_channels_str, str):
         tcn_channels = tuple(int(x) for x in tcn_channels_str.split(',') if x)
     else:
-        # allow list from YAML
         tcn_channels = tuple(int(x) for x in tcn_channels_str)
     tcn_kernel_size = int(ckpt.get('tcn_kernel_size', getattr(args, 'tcn_kernel_size', 3)))
     tcn_dropout = float(ckpt.get('tcn_dropout', getattr(args, 'tcn_dropout', 0.0)))
     dec_hidden = tuple(int(x) for x in str(getattr(args, 'dec_hidden', '256,256')).split(',') if x)
-    # Pull extra hyperparameters from checkpoint when available to match training
     enc_diag_eps = ckpt.get('enc_diag_eps', getattr(args, 'enc_diag_eps', 1e-4))
     dec_eps = ckpt.get('dec_eps', getattr(args, 'dec_eps', 1e-6))
     dec_logvar_min = ckpt.get('dec_logvar_min', getattr(args, 'dec_logvar_min', -5.0))
@@ -91,55 +103,23 @@ def main() -> None:
         prior_jitter=prior_jitter,
         prior_variance_floor=prior_variance_floor,
     ).to(device)
-    # Accept either full checkpoint dict with 'model' key or raw state_dict
     state = ckpt['model'] if isinstance(ckpt, dict) and 'model' in ckpt else ckpt
     model.load_state_dict(state)
     model.eval()
 
-    # Standardize full series and run reconstruction (batch=1)
+    # Standardize full series
     hours_all = times_to_hour_index(ts)
     Xa_s = apply_standardization_slotwise(Xa, M, hours_all, slot_mean, slot_std, clip_k=clip_k)
     x_in = torch.from_numpy(Xa_s).unsqueeze(0).to(device)
     m_in = torch.from_numpy(M).unsqueeze(0).to(device)
-    # Confidence-guided blending (fidelity repair) in standardized domain
-    # Obtain deterministic decoder mean and log-variance (z = posterior mean)
-    with torch.no_grad():
-        mean_s_t, logvar_s_t = model.reconstruct(x_in, m_in, use_mean=True, return_logvar=True)
-    y_mean_s = mean_s_t.squeeze(0).cpu().numpy().astype(np.float32)
-    y_logvar_s = logvar_s_t.squeeze(0).cpu().numpy()
-    sigma_s = np.sqrt(np.exp(y_logvar_s.astype(np.float64))).astype(np.float32)
 
-    # Blend weight: higher when |pred-obs| >> k_sigma * sigma
-    k_sigma = getattr(args, 'blend_k_sigma', 1.0)
-    softness = getattr(args, 'blend_softness', 0.5)
-    delta = (y_mean_s - Xa_s)
-    # Avoid division by zero; softness controls transition sharpness
-    denom = max(float(softness), 1e-6)
-    w_all = 1.0 / (1.0 + np.exp(-((np.abs(delta) - float(k_sigma) * sigma_s) / denom)))
+    # MC-median predictions in standardized domain (no blending)
+    y_med_s = mc_median_reconstruct(model, x_in, m_in, samples=16)
 
-    # Only blend on observed entries; keep pure prediction on missing entries
-    obs = (M > 0.5).astype(np.float32)
-    w = w_all * obs + (1.0 - obs)  # missing -> w=1 (use prediction)
-    y_pred_s = w * y_mean_s + (1.0 - w) * Xa_s
-
-    # Unstandardize to original scale
+    # Unstandardize to original scale (replace all entries by predictions)
     mean_t = slot_mean[hours_all]
     std_t = slot_std[hours_all]
-    y_pred = (y_pred_s * std_t + mean_t).astype(np.float32)
-
-    # Also evaluate on clean normal CSV to assess over-repair (should be near identity)
-    Xn_s = apply_standardization_slotwise(Xn, M, hours_all, slot_mean, slot_std, clip_k=clip_k)
-    xn_in = torch.from_numpy(Xn_s).unsqueeze(0).to(device)
-    with torch.no_grad():
-        mean_s_n_t, logvar_s_n_t = model.reconstruct(xn_in, m_in, use_mean=True, return_logvar=True)
-    y_mean_s_n = mean_s_n_t.squeeze(0).cpu().numpy().astype(np.float32)
-    y_logvar_s_n = logvar_s_n_t.squeeze(0).cpu().numpy()
-    sigma_s_n = np.sqrt(np.exp(y_logvar_s_n.astype(np.float64))).astype(np.float32)
-    delta_n = (y_mean_s_n - Xn_s)
-    w_all_n = 1.0 / (1.0 + np.exp(-((np.abs(delta_n) - float(k_sigma) * sigma_s_n) / denom)))
-    w_n = w_all_n * obs + (1.0 - obs)
-    y_pred_s_n = w_n * y_mean_s_n + (1.0 - w_n) * Xn_s
-    y_pred_n = (y_pred_s_n * std_t + mean_t).astype(np.float32)
+    y_pred = (y_med_s * std_t + mean_t).astype(np.float32)
 
     # Compute per-timestamp observed-only MSE for attacked/repaired vs normal
     def mse_timestep(y_true: np.ndarray, y_hat: np.ndarray, mask: np.ndarray) -> np.ndarray:
@@ -155,25 +135,18 @@ def main() -> None:
 
     mse_rep = mse_timestep(Xn, y_pred, M)
     mse_att = mse_timestep(Xn, Xa, M)
-    mse_self = mse_timestep(Xn, y_pred_n, M)
 
     # Compute repair NRMSE (Observed Only), normalization from September normal per-feature across all time steps
-    # Scale sigma_09[j] computed on Xn[:, j] at observed positions only; robust via IQR/1.349 with floor and fallback.
     def compute_sigma09_per_feature(x_normal: np.ndarray, mask: np.ndarray) -> np.ndarray:
         """Return per-feature robust std over the entire month [H]."""
         T_all = x_normal.shape[0]
-        slots_all = np.zeros((T_all,), dtype=np.int64)  # single slot across the whole month
+        slots_all = np.zeros((T_all,), dtype=np.int64)
         _, std_ = masked_robust_slot_stats(x_normal, mask, slots_all, slot_count=1)
-        # std_ has shape [1, H]; squeeze to [H]
         return std_[0].astype(np.float64)
 
-    sigma09 = compute_sigma09_per_feature(Xn, M)  # [H]
+    sigma09 = compute_sigma09_per_feature(Xn, M)
 
     def nrmse_timestep(y_true: np.ndarray, y_hat: np.ndarray, mask: np.ndarray, sigma_feat: np.ndarray) -> np.ndarray:
-        """Per-timestep NRMSE over observed positions only, normalized by per-feature sigma.
-
-        Shapes: y_true/y_hat [T,H], mask [T,H], sigma_feat [H].
-        """
         T_, H_ = y_true.shape
         if sigma_feat.shape[0] != H_:
             raise ValueError('sigma_feat must have shape [H]')
@@ -184,22 +157,18 @@ def main() -> None:
             cnt = int(obs.sum())
             if cnt > 0:
                 diff = y_hat[t, obs].astype(np.float64) - y_true[t, obs].astype(np.float64)
-                # mean of ((diff/sigma)^2) over observed features at this timestamp
                 se_norm = (diff * diff) * inv_sigma2[obs]
                 out[t] = float(np.sqrt(np.mean(se_norm)))
         return out
 
     nrmse_rep = nrmse_timestep(Xn, y_pred, M, sigma09)
     nrmse_att = nrmse_timestep(Xn, Xa, M, sigma09)
-    nrmse_self = nrmse_timestep(Xn, y_pred_n, M, sigma09)
 
-    # Optional global NRMSE (Observed Only) as a single summary scalar for repaired series
     def nrmse_global(y_true: np.ndarray, y_hat: np.ndarray, mask: np.ndarray, sigma_feat: np.ndarray) -> float:
         obs = mask > 0.5
         if not np.any(obs):
             return float('nan')
         diff = (y_hat.astype(np.float64) - y_true.astype(np.float64))
-        # broadcast sigma over time
         sigma2 = (sigma_feat.astype(np.float64) ** 2).reshape(1, -1)
         se_norm = (diff * diff) / sigma2
         se_norm_obs = se_norm[obs]
@@ -207,7 +176,6 @@ def main() -> None:
 
     nrmse_rep_global = nrmse_global(Xn, y_pred, M, sigma09)
     nrmse_att_global = nrmse_global(Xn, Xa, M, sigma09)
-    nrmse_self_global = nrmse_global(Xn, y_pred_n, M, sigma09)
 
     # Terminal summary: Top-10 and Worst-10 by MSE repair effect (att - rep)
     df_a = pd.read_csv(args.infer_attacked_csv)
@@ -245,7 +213,6 @@ def main() -> None:
     print('\n===== NRMSE Metrics (Observed Only, Sept feature-scale) =====')
     print(f"- NRMSE (attacked vs normal): {nrmse_att_global:.6f}")
     print(f"- NRMSE (repaired vs normal): {nrmse_rep_global:.6f}")
-    print(f"- NRMSE (clean self vs normal): {nrmse_self_global:.6f}")
     if np.isfinite(nrmse_att_global) and np.isfinite(nrmse_rep_global):
         abs_imp = nrmse_att_global - nrmse_rep_global
         rel_red = (1.0 - (nrmse_rep_global / max(nrmse_att_global, 1e-12))) * 100.0
@@ -274,8 +241,7 @@ def main() -> None:
         for r, t in enumerate(worst_idx_n, 1):
             print(f"  {r:>4d}  {ts_s[int(t)]:>19s}  {fmt(nrmse_att[t])}  {fmt(nrmse_rep[t])}  {fmt(nrmse_att[t]-nrmse_rep[t])}")
 
-    print('\nInference finished. (metrics printed; no CSV written)')
-
 
 if __name__ == '__main__':
     main()
+

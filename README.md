@@ -1,13 +1,15 @@
-﻿# TCN-VAE: Generative Reconstruction for FDIA
+# TCN-VAE: Generative Reconstruction for FDIA
 
-End-to-end Temporal Convolutional Network Variational Autoencoder (TCN-VAE) for power-system measurement streams. The model learns nominal trajectories and reconstructs attacked inputs by aligning them with the paired normal sequence at the same timestamps, using observed-only losses.
+End-to-end Temporal Convolutional Network Variational Autoencoder (TCN-VAE) for power-system measurement streams. The model learns nominal trajectories and reconstructs attacked inputs by aligning them with paired normal sequences at identical timestamps, using observed-only losses. The pipeline is streamlined: two-phase training on normal-only data and metrics-only inference (no CSV outputs).
 
 ---
 
 ## Repository Layout
 - `tcn_vae/` Core library (data loaders, model, trainer, metrics, config).
-- `scripts/train.py` Train on normal-only windows with FDIA noise injection (per-step sparse attacks) and observed-only NLL + KL.
-- `scripts/infer_reconstruct.py` Reconstruct attacked sequences over a specified window and report observed-space metrics.
+- `scripts/train.py` Two-phase training on normal-only windows: Phase-1 identity pretraining (ELBO only), Phase-2 robust training (sparse contiguous Laplace attacks + anchor loss).
+- `scripts/infer_reconstruct.py` Full-series reconstruction for September paired data; prints observed-space metrics only.
+- `scripts/infer_reconstruct_mc_median16.py` MC-median reconstruction variant for experimentation; adapted to the new config loader.
+- `scripts/verify_case118_logistic_issue.py`, `scripts/verify_overrepair_mc_median16.py` Utilities to assess over-repair on clean sequences; adapted to the new config loader.
 - `input/` Example datasets and structure description.
 - `output/` All generated artifacts.
 
@@ -24,56 +26,45 @@ End-to-end Temporal Convolutional Network Variational Autoencoder (TCN-VAE) for 
 - Files are UTF-8 without BOM and include a header row.
 - First column: `timestimp` (string), normalized to `YYYY/MM/DD HH:MM`.
 - Remaining columns: numeric features (float), `NaN` denotes missing.
-- Feature dimensions by benchmark:
-  - IEEE 14-bus: 144 features
-  - IEEE 57-bus: 575 features
-  - IEEE 118-bus: 1202 features
+- Feature dimensions:
+  - IEEE 14-bus: 144
+  - IEEE 57-bus: 575
+  - IEEE 118-bus: 1202
 - Row count: 17,857 rows per file (1 header + 17,856 time steps).
 
-- Data locations
-- Training (2025/07鈥?8): under `input/{case}/train/`
-  - Normal CSV: `*_2025-07_2025-08_clean_noisy.csv` (used to fit and train with FDIA injection on-the-fly).
-- Inference (2025/09): under `input/{case}/infer/`
+Data locations
+- Training (2025/07–08): `input/{case}/train/`
+  - Normal CSV only: e.g., `*_2025-07_2025-08_clean_noisy.csv`.
+- Inference (2025/09): `input/{case}/infer/`
   - Paired CSVs: `*_2025-09_clean_noisy.csv` (normal) and `*_fdia_2025-09_noisy.csv` (attacked).
 
 ---
 
 ## Training and Inference Policy (No Data Leakage)
-- Training uses 2025/07鈥?8 normal CSV only; FDIA attacks are simulated by per-step sparse Gaussian injection in standardized domain.
-- Training normal CSV must not contain `fdia` nor `2025-09`. Any `2025-09` path is forbidden in training configuration.
-- Standardization uses slot-wise robust (hour-of-day) statistics computed from the training normal split only and saved next to the checkpoint; these statistics are reused for inference (no re-fitting on 2025/09).
+- Training uses 2025/07–08 normal CSV only; no September files are used for training.
+- Training normal CSV must not contain `fdia` nor `2025-09` (enforced by config validation).
+- Standardization uses slot-wise robust (hour-of-day) statistics computed from the training split and saved next to the checkpoint; reused for inference without re-fitting.
 
 Observed-only reconstruction and masks
-- The model consumes attacked inputs and computes NLL against the aligned normal targets.
 - Only observed positions (mask == 1) contribute to loss/metrics; missing entries are not penalized.
-- The observability mask is derived from `NaN` positions and is enforced identical across paired CSVs. Encoder inputs are mask-aware via concatenation: `[x*mask, mask]`.
+- Observability mask is derived from `NaN` positions and is enforced identical across paired CSVs.
+- Encoder inputs are mask-aware via concatenation: `[x*mask, mask]`.
 
 ---
 
-## FDIA Injection (Training)
+## Training Scheme (Two Phases)
 
-During training and validation, False Data Injection Attacks (FDIA) are simulated on-the-fly in the standardized domain.
+- Phase-1: Identity Pretraining (Normal → Normal)
+  - Use only clean normal windows; no synthetic attacks.
+  - Objective: ELBO (observed-only Gaussian NLL + KL with linear warm-up).
 
-- Notation: `x_target 鈭?R^{B脳T脳H}` (standardized clean inputs), `m 鈭?{0,1}^{B脳T脳H}` (observability mask).
-- Per-step sparse attacks: for each batch `b` and time step `t`, pick a sparse subset of observed features to attack.
-- Attack rate: fixed fraction `q = 0.15` (no config switch). If no observed feature is selected, force-select `ceil(q 路 N_obs)` (or 1 if `N_obs > 0`). If `N_obs=0`, fall back to full domain (will be masked out by `m`).
-- Noise: i.i.d. Gaussian `蔚 ~ N(0, 蟽^2)` with `蟽 = noise.strength`.
+- Phase-2: Robust Training (Sparse, Contiguous Laplace Attacks + Anchor)
+  - For each batch sample, with probability `robust.clean_fraction`, keep the whole window clean (strong fidelity constraint).
+  - Otherwise sample a single contiguous time segment `L ∈ [seg_len_min, seg_len_max]` and a feature subset fraction in `[dims_fraction_min, dims_fraction_max]`.
+  - Add Laplace(0, b) offsets on observed entries within that rectangle, with `b` drawn from `robust.laplace_scales`.
+  - Add anchor loss on non-attacked observed positions: `λ · mean((ŷ - x)^2 | a=0, m=1)` with `λ = train.anchor_lambda`, suppressing over-repair on clean inputs.
 
-Formula (elementwise Hadamard products):
-
-```
-Given x_target, m, strength 蟽, rate q, for each (b, t):
-  obs_idx = { j | m[b,t,j] = 1 }
-  A[b,t,:] = 0
-  Sample S 鈯?obs_idx by Bernoulli(q); if S = 鈭?and |obs_idx|>0, pick k=ceil(q路|obs_idx|) random indices; set A[b,t,S]=1
-  Sample 蔚[b,t,:] ~ Normal(0, 蟽^2 I)
-  x_input[b,t,:] = x_target[b,t,:] + 蔚[b,t,:] 鈯?A[b,t,:] 鈯?m[b,t,:]
-```
-
-- The model receives `x_input` and is optimized to reconstruct `x_target` using observed-only Gaussian NLL + KL.
-- Training and validation both use the same injection scheme (with `noise.seed` for reproducibility).
-
-Inference is unchanged: paired (attacked/normal) data from 2025/09 are used for evaluation only.
+Inference uses September paired normal/attacked CSVs and prints observed-space metrics. No synthetic noise is used during inference.
 
 ---
 
@@ -83,11 +74,11 @@ All parameters are configured in a single `config.yaml` at the project root.
 
 1) Configure
 - Edit `config.yaml` and set:
-  - `global.case`, `global.data_dir`
-  - `train.normal_csv` (07鈥?8)
-  - `noise.strength`, `noise.seed` (training-time FDIA injection)
-  - `infer.normal_csv`, `infer.attacked_csv` (09)
-  - `model`, `train`, `window`
+  - `global.case`
+  - `train.normal_csv`, `train.epochs`, `train.phase1_epochs`, `train.phase2_epochs`, `train.anchor_lambda`
+  - `robust.clean_fraction`, `robust.seg_len` (min,max), `robust.dims_fraction` (min,max), `robust.laplace_scales`
+  - `infer.normal_csv`, `infer.attacked_csv`
+  - `model`, `window`, `preprocess`
 
 2) Train
 ```
@@ -96,23 +87,24 @@ python scripts/train.py
 Artifacts go to `output/<case>/models/<exp_name>/`:
 - `ckpt.pt` (with minimal hyperparameters)
 - `slot_stats.npz` (slot-wise robust standardization stats for hour-of-day)
-- `training_curve.tsv` (two lines: train loss, val loss sequences)
+- `training_curve.tsv` (four lines: P1 train, P1 val, P2 train, P2 val)
 
-3) Inference (Reconstruction)
+3) Inference (Metrics Only)
 ```
 python scripts/infer_reconstruct.py
 ```
-Outputs are written under `output/<case>/infer/<exp_name>/`:
-- `reconstructed.csv` (full-series reconstruction on original scale)
+Console output includes:
+- Reconstruction metrics (Observed Only): top/worst timestamps by MSE improvement (att - rep)
+- NRMSE metrics (Observed Only): attacked vs normal; repaired vs normal; optional clean self vs normal
+No CSVs are written during inference.
 
 ---
 
 ## Model Overview
 - Encoder: causal TCN produces per-step diagonal Gaussian `q(z_t|x_<=t)`.
-- Prior: AR(1) state-space model with optional low-rank noise.
+- Prior: AR(1) state-space model with low-rank noise (always enabled).
 - Decoder: MLP outputs per-step Gaussian mean and log-variance.
 - Training objective: observed-only Gaussian NLL + KL regularization (with warm-up).
-  - KL warm-up: linear 0 鈫?`beta` during the first ~20% of epochs; always enabled (no configuration switch).
 
 ---
 
@@ -128,22 +120,20 @@ Outputs are written under `output/<case>/infer/<exp_name>/`:
 
 ---
 
-## Inference Specifics (Current Implementation)
-- Full-series reconstruction: the script standardizes the entire 2025/09 attacked series, runs causal reconstruction, and unstandardizes to original scale.
-- No window/MC: window selection and MC averaging are removed to keep the pipeline minimal.
-- No passthrough of observed inputs: reconstructed values are model predictions at all positions.
-- Standardization: uses slot-wise robust (hour-of-day) statistics computed from 2025/07鈥?8 normal training split; no re-fitting on 2025/09.
-- Terminal summary: prints Top-10 and Worst-10 timestamps by MSE repair effect (att - rep) on observed positions only.
+## Inference Specifics
+- The script standardizes the full 2025/09 series, reconstructs with the posterior mean path and decoder variance, applies confidence-guided blending on observed entries, then unstandardizes to original scale.
+- A separate MC-median script is provided for experimentation; both follow the same metric definitions.
+- Terminal summary prints top/worst timestamps by MSE improvement and global NRMSE statistics. No files are written.
 
 ## Configuration Notes
-- Model hyperparameters:
-  - `model.tcn_channels`: comma-separated string or YAML list (e.g., "256,256,256").
-  - `model.tcn_kernel_size`: positive int (e.g., 3).
-  - `model.tcn_dropout`: float in [0,1] (default 0.0).
-- Encoder inputs are mask-aware via concatenation `[x*mask, mask]`; the mask derives from `NaN` positions and is enforced identical across paired CSVs.
-- Decoder predicts time-varying mean and log-variance; a hard upper bound on log-variance prevents variance blow-up.
+- `model.tcn_channels`: comma-separated string or YAML list (e.g., "256,256,256").
+- `model.tcn_kernel_size`: positive int (e.g., 3).
+- `model.tcn_dropout`: float in [0,1] (default 0.0).
+- Encoder inputs use concatenation `[x*mask, mask]`; the mask is identical across paired CSVs.
+- Decoder predicts time-varying mean and log-variance with clamped bounds.
 
 ---
 
 ## License
 Research use within the TCN-VAE FDIA defense project. See forthcoming license documentation for details.
+

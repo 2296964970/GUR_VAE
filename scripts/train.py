@@ -32,6 +32,9 @@ def main() -> None:
         train_ratio=args.train_ratio,
         val_ratio=args.val_ratio,
         seed=args.seed,
+        num_workers=getattr(args, 'num_workers', 0),
+        clip_k=getattr(args, 'clip_k', 0.0),
+        std_floor=getattr(args, 'std_floor', 1e-3),
     )
 
     batch0 = first_batch_or_exit(loaders.train, '[error] Train loader is empty (no windows). Adjust time_length/stride.')
@@ -50,30 +53,32 @@ def main() -> None:
         dec_hidden=dec_hidden,
         beta=args.beta,
         obs_init_logvar=args.obs_init_logvar,
+        enc_diag_eps=getattr(args, 'enc_diag_eps', 1e-4),
+        dec_eps=getattr(args, 'dec_eps', 1e-6),
+        dec_logvar_min=getattr(args, 'dec_logvar_min', -5.0),
+        dec_logvar_max=getattr(args, 'dec_logvar_max', 2.302585092994046),
+        prior_rank=getattr(args, 'prior_rank', 4),
+        prior_a_init=getattr(args, 'prior_a_init', 0.95),
+        prior_q_init=getattr(args, 'prior_q_init', 0.1),
+        prior_m0_init=getattr(args, 'prior_m0_init', 0.0),
+        prior_P0_init=getattr(args, 'prior_P0_init', 1.0),
+        prior_jitter=getattr(args, 'prior_jitter', 1e-6),
+        prior_variance_floor=getattr(args, 'prior_variance_floor', 1e-6),
     )
 
     device = resolve_device(args.device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
-    fractions_raw = getattr(args, 'noise_fractions', '')
-    if isinstance(fractions_raw, str):
-        cleaned = fractions_raw.replace('[', '').replace(']', '')
+    # Robust phase parameters
+    lap_scales_raw = getattr(args, 'robust_laplace_scales', '')
+    if isinstance(lap_scales_raw, str):
+        cleaned = lap_scales_raw.replace('[', '').replace(']', '')
         parts = [p.strip() for p in cleaned.split(',') if p.strip()]
-        noise_fraction_tuple = tuple(float(p) for p in parts)
-    elif isinstance(fractions_raw, (list, tuple)):
-        noise_fraction_tuple = tuple(float(p) for p in fractions_raw)
+        laplace_scales = tuple(float(p) for p in parts) if parts else (0.1, 0.3, 0.7, 1.2)
+    elif isinstance(lap_scales_raw, (list, tuple)):
+        laplace_scales = tuple(float(p) for p in lap_scales_raw)
     else:
-        noise_fraction_tuple = tuple()
-
-    strengths_raw = getattr(args, 'noise_strengths', '')
-    if isinstance(strengths_raw, str):
-        cleaned_s = strengths_raw.replace('[', '').replace(']', '')
-        parts_s = [p.strip() for p in cleaned_s.split(',') if p.strip()]
-        noise_strength_tuple = tuple(float(p) for p in parts_s)
-    elif isinstance(strengths_raw, (list, tuple)):
-        noise_strength_tuple = tuple(float(p) for p in strengths_raw)
-    else:
-        noise_strength_tuple = tuple()
+        laplace_scales = (0.1, 0.3, 0.7, 1.2)
 
     trainer = OnlineTrainer(
         model,
@@ -81,36 +86,38 @@ def main() -> None:
         device=device,
         grad_clip=args.grad_clip,
         beta=args.beta,
-        noise_strength=getattr(args, 'noise_strength', 0.5),
-        noise_seed=getattr(args, 'noise_seed', 1337),
-        noise_fractions=noise_fraction_tuple,
-        noise_strengths=noise_strength_tuple,
+        anchor_lambda=getattr(args, 'anchor_lambda', 1.0),
+        clean_fraction=getattr(args, 'clean_fraction', 0.4),
+        seg_len_min=getattr(args, 'seg_len_min', 8),
+        seg_len_max=getattr(args, 'seg_len_max', max(8, args.time_length // 2)),
+        dims_fraction_min=getattr(args, 'dims_fraction_min', 0.05),
+        dims_fraction_max=getattr(args, 'dims_fraction_max', 0.3),
+        laplace_scales=laplace_scales,
+        rng_seed=getattr(args, 'seed', 1337),
     )
 
     # Training output directory: <train_model_root>/<exp_name>
     outdir = args.model_dir
     os.makedirs(outdir, exist_ok=True)
 
-    train_curve = {'loss': [], 'val': []}
+    train_curve = {'p1_loss': [], 'p1_val': [], 'p2_loss': [], 'p2_val': []}
     best_val = float('inf')
     best_state = None
 
-    # Built-in schedule (no toggle):
-    # - KL warm-up: linear 0 -> beta over first ~20% epochs
-    warmup_epochs = max(1, int(round(args.epochs * 0.2)))
-    for epoch in range(1, args.epochs + 1):
-        # Update beta schedule
-        cur_beta = args.beta * min(1.0, epoch / float(warmup_epochs))
+    # Phase-1: identity mapping (no augmentation, ELBO only)
+    p1_epochs = int(getattr(args, 'phase1_epochs', max(1, args.epochs // 4)))
+    warmup_p1 = max(1, int(round(p1_epochs * float(getattr(args, 'warmup_frac', 0.2)))))
+    for epoch in range(1, p1_epochs + 1):
+        cur_beta = args.beta * min(1.0, epoch / float(warmup_p1))
         trainer.beta = cur_beta
-        tr = trainer.train_epoch(loaders.train)
+        tr = trainer.train_epoch(loaders.train, robust=False)
         va = trainer.evaluate(loaders.val)
-        train_curve['loss'].append(tr.loss)
-        train_curve['val'].append(va.loss)
+        train_curve['p1_loss'].append(tr.loss)
+        train_curve['p1_val'].append(va.loss)
         print(
-            f'Epoch {epoch:03d} | beta {cur_beta:.4f} | '
-            f'train loss {tr.loss:.4f} (nll {tr.nll:.4f}, kl {tr.kl:.4f}) | '
-            f'val loss {va.loss:.4f} (nll {va.nll:.4f}, kl {va.kl:.4f}) | '
-            f'mse_obs val {va.mse_obs:.6f}'
+            f'[P1] Epoch {epoch:03d}/{p1_epochs} | beta {cur_beta:.4f} | '
+            f'train {tr.loss:.4f} (nll {tr.nll:.4f}, kl {tr.kl:.4f}) | '
+            f'val {va.loss:.4f} (nll {va.nll:.4f}, kl {va.kl:.4f}) | mse_obs val {va.mse_obs:.6f}'
         )
         if va.loss < best_val:
             best_val = va.loss
@@ -119,6 +126,32 @@ def main() -> None:
                 'optimizer': optimizer.state_dict(),
                 'epoch': epoch,
                 'val_loss': va.loss,
+                'phase': 'p1',
+            }
+
+    # Phase-2: robust training with Laplace segment attacks + anchor loss
+    p2_epochs = int(getattr(args, 'phase2_epochs', max(1, args.epochs - p1_epochs)))
+    warmup_p2 = max(1, int(round(p2_epochs * float(getattr(args, 'warmup_frac', 0.2)))))
+    for epoch in range(1, p2_epochs + 1):
+        cur_beta = args.beta * min(1.0, epoch / float(warmup_p2))
+        trainer.beta = cur_beta
+        tr = trainer.train_epoch(loaders.train, robust=True)
+        va = trainer.evaluate(loaders.val)
+        train_curve['p2_loss'].append(tr.loss)
+        train_curve['p2_val'].append(va.loss)
+        print(
+            f'[P2] Epoch {epoch:03d}/{p2_epochs} | beta {cur_beta:.4f} | '
+            f'train {tr.loss:.4f} (nll {tr.nll:.4f}, kl {tr.kl:.4f}) | '
+            f'val {va.loss:.4f} (nll {va.nll:.4f}, kl {va.kl:.4f}) | mse_obs val {va.mse_obs:.6f}'
+        )
+        if va.loss < best_val:
+            best_val = va.loss
+            best_state = {
+                'model': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'epoch': epoch,
+                'val_loss': va.loss,
+                'phase': 'p2',
             }
 
     if best_state is not None:
@@ -129,6 +162,17 @@ def main() -> None:
             'tcn_kernel_size': args.tcn_kernel_size,
             'tcn_dropout': args.tcn_dropout,
             'dec_hidden': args.dec_hidden,
+            'enc_diag_eps': getattr(args, 'enc_diag_eps', 1e-4),
+            'dec_eps': getattr(args, 'dec_eps', 1e-6),
+            'dec_logvar_min': getattr(args, 'dec_logvar_min', -5.0),
+            'dec_logvar_max': getattr(args, 'dec_logvar_max', 2.302585092994046),
+            'prior_rank': getattr(args, 'prior_rank', 4),
+            'prior_a_init': getattr(args, 'prior_a_init', 0.95),
+            'prior_q_init': getattr(args, 'prior_q_init', 0.1),
+            'prior_m0_init': getattr(args, 'prior_m0_init', 0.0),
+            'prior_P0_init': getattr(args, 'prior_P0_init', 1.0),
+            'prior_jitter': getattr(args, 'prior_jitter', 1e-6),
+            'prior_variance_floor': getattr(args, 'prior_variance_floor', 1e-6),
         })
         torch.save(best_state, os.path.join(outdir, 'ckpt.pt'))
         # Save slot-wise robust standardization statistics
@@ -138,6 +182,7 @@ def main() -> None:
             std=loaders.slot_std,
             slot_kind=str(getattr(loaders, 'slot_kind', 'hour')),
             clip_k=float(getattr(loaders, 'clip_k', 5.0)),
+            std_floor=float(getattr(args, 'std_floor', 1e-3)),
         )
 
     if best_state is not None:
@@ -147,8 +192,10 @@ def main() -> None:
         va_best = trainer.evaluate(loaders.val)
 
     with open(os.path.join(outdir, 'training_curve.tsv'), 'w') as f:
-        f.write('\t'.join(map(str, train_curve['loss'])) + '\n')
-        f.write('\t'.join(map(str, train_curve['val'])) + '\n')
+        f.write('P1_train\t' + '\t'.join(map(str, train_curve['p1_loss'])) + '\n')
+        f.write('P1_val\t' + '\t'.join(map(str, train_curve['p1_val'])) + '\n')
+        f.write('P2_train\t' + '\t'.join(map(str, train_curve['p2_loss'])) + '\n')
+        f.write('P2_val\t' + '\t'.join(map(str, train_curve['p2_val'])) + '\n')
 
     print('Training finished. Artifacts saved to:', outdir)
 

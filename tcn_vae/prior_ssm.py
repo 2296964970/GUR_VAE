@@ -16,8 +16,10 @@ def _softplus_inverse(value: float, eps: float = 1e-6) -> float:
 class SSMPrior(nn.Module):
     """Sparse low-rank VAR(1) state-space prior.
 
-    Dynamics: z_t = A z_{t-1} + eps_t, eps_t ~ N(0, D + U U^T).
+    Dynamics: z_t = A z_{t-1} + eps_t, eps_t ~ N(0, diag(q) + U U^T).
     A is masked to enforce sparsity and stabilised to satisfy rho(A) < 1.
+    The prior always uses a low-rank correction on top of diagonal noise
+    (rank >= 1); the pure diagonal-only covariance path is removed.
     """
 
     def __init__(
@@ -40,7 +42,11 @@ class SSMPrior(nn.Module):
         if P0_init <= 0.0:
             raise ValueError('P0_init must be positive')
         self.D = int(latent_dim)
-        self.rank = int(rank) if rank is not None else 0
+        # Enforce low-rank correction always enabled (rank >= 1)
+        r = 1 if rank is None else int(rank)
+        if r <= 0:
+            r = 1
+        self.rank = r
         self.jitter = 1e-6
         self.variance_floor = 1e-6
         dev = device if device is not None else torch.device('cpu')
@@ -68,12 +74,10 @@ class SSMPrior(nn.Module):
         self.m0 = nn.Parameter(torch.full((self.D,), float(m0_init), device=dev, dtype=dt))
         self.raw_P0 = nn.Parameter(torch.full((self.D,), raw_P0_init, device=dev, dtype=dt))
 
-        if self.rank > 0:
-            U = torch.zeros(self.D, self.rank, device=dev, dtype=dt)
-            nn.init.normal_(U, mean=0.0, std=0.05)
-            self.U = nn.Parameter(U)
-        else:
-            self.register_parameter('U', None)
+        # Always allocate low-rank component U (rank >= 1)
+        U = torch.zeros(self.D, self.rank, device=dev, dtype=dt)
+        nn.init.normal_(U, mean=0.0, std=0.05)
+        self.U = nn.Parameter(U)
 
     @staticmethod
     def _build_band_mask(dim: int, bandwidth: int) -> torch.Tensor:
@@ -107,9 +111,9 @@ class SSMPrior(nn.Module):
 
         q_diag = F.softplus(self.raw_q).clamp_min(self.variance_floor).to(device=dev, dtype=dt)
         Q = torch.diag(q_diag)
-        if self.rank > 0 and self.U is not None:
-            U = self.U.to(device=dev, dtype=dt)
-            Q = Q + torch.matmul(U, U.t())
+        # Always add low-rank correction UU^T
+        U = self.U.to(device=dev, dtype=dt)
+        Q = Q + torch.matmul(U, U.t())
         Q = Q + self.jitter * torch.eye(self.D, device=dev, dtype=dt)
 
         m0 = self.m0.to(device=dev, dtype=dt)

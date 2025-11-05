@@ -136,6 +136,7 @@ def masked_robust_slot_stats(
     *,
     slot_count: int = 24,
     eps: float = 1e-6,
+    std_floor: float = 1e-3,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Robust per-slot median and std via IQR on observed entries.
 
@@ -171,7 +172,6 @@ def masked_robust_slot_stats(
     g_q25 = np.nanpercentile(X_obs, 25.0, axis=0)
     g_q75 = np.nanpercentile(X_obs, 75.0, axis=0)
     g_std = (g_q75 - g_q25) / 1.349
-    std_floor = 1e-3
     g_std = np.clip(g_std, std_floor, None)
     med = np.where(np.isnan(med), g_med.reshape(1, H), med)
     robust_std = np.where(np.isnan(robust_std), g_std.reshape(1, H), robust_std)
@@ -243,6 +243,9 @@ def create_normal_loaders(
     val_ratio: float = 0.15,
     seed: Optional[int] = 1337,
     num_workers: int = 0,
+    # Standardization controls
+    clip_k: float = 0.0,
+    std_floor: float = 1e-3,
 ) -> DataModule:
     Xn, M_struct, ts = load_timeseries(train_normal_csv)
     T, H = Xn.shape
@@ -261,11 +264,19 @@ def create_normal_loaders(
     hours_tr = hours[s_train]
     hours_va = hours[s_val]
     hours_te = hours[s_test]
-    slot_mean, slot_std = masked_robust_slot_stats(Xn_tr, M_tr, hours_tr, slot_count=24)
-    CLIP_K = 0.0
-    Xn_tr_s = apply_standardization_slotwise(Xn_tr, M_tr, hours_tr, slot_mean, slot_std, clip_k=CLIP_K)
-    Xn_va_s = apply_standardization_slotwise(Xn_va, M_va, hours_va, slot_mean, slot_std, clip_k=CLIP_K)
-    Xn_te_s = apply_standardization_slotwise(Xn_te, M_te, hours_te, slot_mean, slot_std, clip_k=CLIP_K)
+    slot_mean, slot_std = masked_robust_slot_stats(
+        Xn_tr, M_tr, hours_tr, slot_count=24, std_floor=float(std_floor)
+    )
+    CLIP_K = float(clip_k)
+    Xn_tr_s = apply_standardization_slotwise(
+        Xn_tr, M_tr, hours_tr, slot_mean, slot_std, clip_k=CLIP_K
+    )
+    Xn_va_s = apply_standardization_slotwise(
+        Xn_va, M_va, hours_va, slot_mean, slot_std, clip_k=CLIP_K
+    )
+    Xn_te_s = apply_standardization_slotwise(
+        Xn_te, M_te, hours_te, slot_mean, slot_std, clip_k=CLIP_K
+    )
 
     ds_train = NormalSlidingWindowDataset(Xn_tr_s, M_tr.astype(np.float32), time_length, stride)
     ds_val = NormalSlidingWindowDataset(Xn_va_s, M_va.astype(np.float32), time_length, stride)
