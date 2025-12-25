@@ -114,18 +114,28 @@ class DataModule:
     test: DataLoader
     slot_mean: np.ndarray
     slot_std: np.ndarray
-    slot_kind: str
     clip_k: float
 
 
-def times_to_hour_index(ts: pd.Series) -> np.ndarray:
-    """Convert timestamps to hour-of-day indices [0..23]."""
-    try:
-        hours = pd.to_datetime(ts, errors='raise').dt.hour.to_numpy()
-    except Exception:
+def times_to_5min_index(ts: pd.Series) -> np.ndarray:
+    """Convert timestamps to 5-minute within-day slot indices [0..287]."""
+    dt = pd.to_datetime(ts, errors='coerce')
+    if dt.isna().any():
+        # Fallback: extract HH:MM pattern from strings
         s = ts.astype(str)
-        hours = s.str.slice(11, 13).astype(int).to_numpy()
-    return hours.astype(np.int64)
+        hhmm = s.str.extract(r'(?P<hour>\d{1,2}):(?P<minute>\d{2})')
+        if hhmm.isna().any().any():
+            raise ValueError('timestamps cannot be parsed into hour/minute')
+        hours = hhmm['hour'].astype(int)
+        minutes = hhmm['minute'].astype(int)
+    else:
+        hours = dt.dt.hour
+        minutes = dt.dt.minute
+    if ((hours < 0) | (hours > 23) | (minutes < 0) | (minutes > 59)).any():
+        raise ValueError('timestamps contain out-of-range hour/minute')
+    total_minutes = hours.to_numpy() * 60 + minutes.to_numpy()
+    slots = (total_minutes // 5).astype(np.int64)
+    return slots
 
 
 
@@ -134,7 +144,7 @@ def masked_robust_slot_stats(
     m: np.ndarray,
     slots: np.ndarray,
     *,
-    slot_count: int = 24,
+    slot_count: int = 288,
     eps: float = 1e-6,
     std_floor: float = 1e-3,
 ) -> Tuple[np.ndarray, np.ndarray]:
@@ -243,7 +253,6 @@ def create_normal_loaders(
     val_ratio: float = 0.15,
     seed: Optional[int] = 1337,
     num_workers: int = 0,
-    # Standardization controls
     clip_k: float = 0.0,
     std_floor: float = 1e-3,
 ) -> DataModule:
@@ -259,23 +268,27 @@ def create_normal_loaders(
     Xn_va, M_va = Xn[s_val], M_struct[s_val]
     Xn_te, M_te = Xn[s_test], M_struct[s_test]
 
-    # Slot-wise robust standardization computed from training normal only (hour-of-day)
-    hours = times_to_hour_index(ts)
-    hours_tr = hours[s_train]
-    hours_va = hours[s_val]
-    hours_te = hours[s_test]
+    # Standardization computed from training normal only.
+    # Keep the original behaviour: robust within-day 5-minute slot stats (288 slots/day).
+    slots = times_to_5min_index(ts)
+    slot_count = 288
+
+    slots_tr = slots[s_train]
+    slots_va = slots[s_val]
+    slots_te = slots[s_test]
+
     slot_mean, slot_std = masked_robust_slot_stats(
-        Xn_tr, M_tr, hours_tr, slot_count=24, std_floor=float(std_floor)
+        Xn_tr, M_tr, slots_tr, slot_count=int(slot_count), std_floor=float(std_floor)
     )
     CLIP_K = float(clip_k)
     Xn_tr_s = apply_standardization_slotwise(
-        Xn_tr, M_tr, hours_tr, slot_mean, slot_std, clip_k=CLIP_K
+        Xn_tr, M_tr, slots_tr, slot_mean, slot_std, clip_k=CLIP_K
     )
     Xn_va_s = apply_standardization_slotwise(
-        Xn_va, M_va, hours_va, slot_mean, slot_std, clip_k=CLIP_K
+        Xn_va, M_va, slots_va, slot_mean, slot_std, clip_k=CLIP_K
     )
     Xn_te_s = apply_standardization_slotwise(
-        Xn_te, M_te, hours_te, slot_mean, slot_std, clip_k=CLIP_K
+        Xn_te, M_te, slots_te, slot_mean, slot_std, clip_k=CLIP_K
     )
 
     ds_train = NormalSlidingWindowDataset(Xn_tr_s, M_tr.astype(np.float32), time_length, stride)
@@ -294,7 +307,6 @@ def create_normal_loaders(
         test=dl_test,
         slot_mean=slot_mean,
         slot_std=slot_std,
-        slot_kind='hour',
         clip_k=CLIP_K,
     )
 
@@ -307,7 +319,7 @@ __all__ = [
     'NormalSlidingWindowDataset',
     'create_normal_loaders',
     'DataModule',
-    'times_to_hour_index',
+    'times_to_5min_index',
     'apply_standardization_slotwise',
     'masked_robust_slot_stats',
 ]

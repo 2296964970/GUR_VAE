@@ -49,3 +49,24 @@ temp_*
 
 # Experiment logs and plots
 experiment_logs/
+
+# LaTeX 辅助文件
+*.aux
+*.log
+*.out
+*.toc
+*.lof
+*.lot
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+*.bbl
+*.blg
+*.bcf
+*.run.xml
+*.nav
+*.snm
+*.vrb
+
+# LaTeX 构建目录
+build/

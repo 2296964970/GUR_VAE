@@ -175,12 +175,11 @@ def main() -> None:
             'prior_variance_floor': getattr(args, 'prior_variance_floor', 1e-6),
         })
         torch.save(best_state, os.path.join(outdir, 'ckpt.pt'))
-        # Save slot-wise robust standardization statistics
+        # Save slot-wise robust stats for inference (5-minute within-day slots).
         np.savez_compressed(
             os.path.join(outdir, 'slot_stats.npz'),
             mean=loaders.slot_mean,
             std=loaders.slot_std,
-            slot_kind=str(getattr(loaders, 'slot_kind', 'hour')),
             clip_k=float(getattr(loaders, 'clip_k', 5.0)),
             std_floor=float(getattr(args, 'std_floor', 1e-3)),
         )

@@ -1,10 +1,10 @@
 # Global dataset selection
 global:
-  case: case118
+  case: case57
 
 # Paired data paths (explicit)
 train:
-  normal_csv: input/case118/train/case118_normal_noisy_2025-07-08.csv
+  normal_csv: input/case57/train/case57_normal_noisy_2025-07-08.csv
   epochs: 60
   # Two-phase schedule
   phase1_epochs: 18   # identity pretraining (ELBO only)
@@ -14,14 +14,14 @@ train:
   learning_rate: 0.0003
   grad_clip: 10000.0
   device: cuda         # cpu | cuda
-  model_dir: output/case118/models/tcn_base_ep118_b01_wu04_lv1
+  model_dir: output/case57/models/tcn_base_ep57
   # KL warmup fraction of epochs
-  warmup_frac: 0.4
+  warmup_frac: 0.2
 
 infer:
-  normal_csv: input/case118/infer/case118_normal_noisy_2025-09.csv
-  attacked_csv: input/case118/infer/case118_attack_noisy_2025-09.csv
-  ckpt: output/case118/models/tcn_base_ep118_b01_wu04_lv1/ckpt.pt
+  normal_csv: input/case57/infer/case57_normal_noisy_2025-09.csv
+  attacked_csv: input/case57/infer/case57_attack_noisy_2025-09.csv
+  ckpt: output/case57/models/tcn_base_ep57/ckpt.pt
   # Optional default range for scripts/infer_range.py (CLI flags override)
   start: "2025-09-15 00:00"
   end: "2025-09-20 23:55"
@@ -41,7 +41,6 @@ preprocess:
   clip_k: 3.0
   # Floor for robust std when computing slot-wise stats to avoid division by near-zero
   std_floor: 0.005
-  # Standardization uses robust within-day 5-minute slots (paper-compatible).
 
 # Windowing and batching
 window:
@@ -65,12 +64,12 @@ robust:
 
 # Model hyperparameters
 model:
-  latent_dim: 128
+  latent_dim: 114
   dec_hidden: "256,256"  # comma-separated or a YAML list, e.g., [256, 256]
   tcn_channels: "256,256,256,256,256"  # 5 layers: receptive field ~125 steps
   tcn_kernel_size: 3
   tcn_dropout: 0.0
-  beta: 0.1
+  beta: 0.5
   obs_init_logvar: -3.5
   encoder:
     # Positive diagonal stabilizer for Cholesky factors from encoder
@@ -80,8 +79,7 @@ model:
     eps: 1.0e-6
     # Clamp bounds on decoded log-variance
     logvar_min: -5.0
-    # Lower max variance to prevent the decoder from "cheating" by inflating uncertainty
-    logvar_max: 1.0
+    logvar_max: 2.302585092994046
   prior:
     rank: 4
     a_init: 0.95

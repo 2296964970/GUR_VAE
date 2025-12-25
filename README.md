@@ -7,11 +7,9 @@ End-to-end Temporal Convolutional Network Variational Autoencoder (TCN-VAE) for 
 ## Repository Layout
 - `tcn_vae/` Core library (data loaders, model, trainer, metrics, config).
 - `scripts/train.py` Two-phase training on normal-only windows: Phase-1 identity pretraining (ELBO only), Phase-2 robust training (sparse contiguous Laplace attacks + anchor loss).
-- `scripts/infer_reconstruct.py` Full-series reconstruction for September paired data; prints observed-space metrics only.
-- `scripts/infer_reconstruct_mc_median16.py` MC-median reconstruction variant for experimentation; adapted to the new config loader.
-- `scripts/verify_case118_logistic_issue.py`, `scripts/verify_overrepair_mc_median16.py` Utilities to assess over-repair on clean sequences; adapted to the new config loader.
 - `input/` Example datasets and structure description.
 - `output/` All generated artifacts.
+- Legacy inference and verification scripts used in earlier experiments (for example, `infer_reconstruct.py`, `infer_reconstruct_mc_median16.py`, `verify_case118_logistic_issue.py`, `verify_overrepair_mc_median16.py`) are no longer shipped in this repository. Users are expected to implement their own inference/evaluation scripts on top of the `tcn_vae` library, following the guidelines below.
 
 ---
 
@@ -43,7 +41,7 @@ Data locations
 ## Training and Inference Policy (No Data Leakage)
 - Training uses 2025/07–08 normal CSV only; no September files are used for training.
 - Training normal CSV must not contain `fdia` nor `2025-09` (enforced by config validation).
-- Standardization uses slot-wise robust (hour-of-day) statistics computed from the training split and saved next to the checkpoint; reused for inference without re-fitting.
+- Standardization uses slot-wise robust (5-minute-of-day) statistics computed from the training split and saved next to the checkpoint; reused for inference without re-fitting.
 
 Observed-only reconstruction and masks
 - Only observed positions (mask == 1) contribute to loss/metrics; missing entries are not penalized.
@@ -63,8 +61,6 @@ Observed-only reconstruction and masks
   - Otherwise sample a single contiguous time segment `L ∈ [seg_len_min, seg_len_max]` and a feature subset fraction in `[dims_fraction_min, dims_fraction_max]`.
   - Add Laplace(0, b) offsets on observed entries within that rectangle, with `b` drawn from `robust.laplace_scales`.
   - Add anchor loss on non-attacked observed positions: `λ · mean((ŷ - x)^2 | a=0, m=1)` with `λ = train.anchor_lambda`, suppressing over-repair on clean inputs.
-
-Inference uses September paired normal/attacked CSVs and prints observed-space metrics. No synthetic noise is used during inference.
 
 ---
 
@@ -86,17 +82,10 @@ python scripts/train.py
 ```
 Artifacts go to `output/<case>/models/<exp_name>/`:
 - `ckpt.pt` (with minimal hyperparameters)
-- `slot_stats.npz` (slot-wise robust standardization stats for hour-of-day)
+- `slot_stats.npz` (slot-wise robust standardization stats for 5-minute slots)
 - `training_curve.tsv` (four lines: P1 train, P1 val, P2 train, P2 val)
 
-3) Inference (Metrics Only)
-```
-python scripts/infer_reconstruct.py
-```
-Console output includes:
-- Reconstruction metrics (Observed Only): top/worst timestamps by MSE improvement (att - rep)
-- NRMSE metrics (Observed Only): attacked vs normal; repaired vs normal; optional clean self vs normal
-No CSVs are written during inference.
+3) Inference / Evaluation
 
 ---
 
@@ -120,11 +109,6 @@ No CSVs are written during inference.
 
 ---
 
-## Inference Specifics
-- The script standardizes the full 2025/09 series, reconstructs with the posterior mean path and decoder variance, applies confidence-guided blending on observed entries, then unstandardizes to original scale.
-- A separate MC-median script is provided for experimentation; both follow the same metric definitions.
-- Terminal summary prints top/worst timestamps by MSE improvement and global NRMSE statistics. No files are written.
-
 ## Configuration Notes
 - `model.tcn_channels`: comma-separated string or YAML list (e.g., "256,256,256").
 - `model.tcn_kernel_size`: positive int (e.g., 3).
@@ -136,4 +120,3 @@ No CSVs are written during inference.
 
 ## License
 Research use within the TCN-VAE FDIA defense project. See forthcoming license documentation for details.
-

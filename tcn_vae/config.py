@@ -109,8 +109,17 @@ def _defaults() -> Dict[str, Any]:
         # Checkpoint
         'ckpt': '',
         # Inference blend controls
-        'blend_k_sigma': 1.0,
-        'blend_softness': 0.5,
+        # Use more conservative defaults; YAML can override
+        'blend_k_sigma': 2.0,
+        'blend_softness': 0.2,
+        # Temperature scaling for decoder sigma during blending
+        'blend_sigma_temperature': 1.0,
+        # Inference range controls (optional; CLI flags can override)
+        'infer_start': '',
+        'infer_end': '',
+        'infer_series': 'both',  # normal | attacked | both
+        # Inference output control
+        'infer_save_outputs': False,
     }
 
 
@@ -226,9 +235,21 @@ def _flatten_config(raw: Dict[str, Any]) -> Dict[str, Any]:
     train_ckpt = os.path.join(d['model_dir'], 'ckpt.pt')
     infer_ckpt = str(_deep_get(raw, 'infer.ckpt', ''))
     d['ckpt'] = infer_ckpt if infer_ckpt else train_ckpt
+    # Inference range controls (optional)
+    d['infer_start'] = str(_deep_get(raw, 'infer.start', d['infer_start'])).strip()
+    d['infer_end'] = str(_deep_get(raw, 'infer.end', d['infer_end'])).strip()
+    infer_series = _deep_get(raw, 'infer.series', d['infer_series'])
+    infer_series_str = str(infer_series).strip().lower() if infer_series is not None else d['infer_series']
+    if infer_series_str not in ('normal', 'attacked', 'both'):
+        infer_series_str = d['infer_series']
+    d['infer_series'] = infer_series_str
     # Inference blending controls
     d['blend_k_sigma'] = float(_deep_get(raw, 'infer.blend_k_sigma', d['blend_k_sigma']))
     d['blend_softness'] = float(_deep_get(raw, 'infer.blend_softness', d['blend_softness']))
+    d['blend_sigma_temperature'] = float(_deep_get(raw, 'infer.blend_sigma_temperature', d['blend_sigma_temperature']))
+    # Inference output control
+    save_outputs = _deep_get(raw, 'infer.save_outputs', d['infer_save_outputs'])
+    d['infer_save_outputs'] = bool(save_outputs)
 
     return d
 

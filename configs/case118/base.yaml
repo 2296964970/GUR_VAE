@@ -7,8 +7,8 @@ train:
   normal_csv: input/case118/train/case118_normal_noisy_2025-07-08.csv
   epochs: 60
   # Two-phase schedule
-  phase1_epochs: 18   # identity pretraining (ELBO only)
-  phase2_epochs: 42    # robust training (Laplace segments + anchor)
+  phase1_epochs: 15  # identity pretraining (ELBO only)
+  phase2_epochs: 45    # robust training (Laplace segments + anchor)
   anchor_lambda: 3.0   # anchor strength on non-attacked observed positions
   seed: 1337
   learning_rate: 0.0003
@@ -66,7 +66,8 @@ robust:
 # Model hyperparameters
 model:
   latent_dim: 128
-  dec_hidden: "256,256"  # comma-separated or a YAML list, e.g., [256, 256]
+
+  dec_hidden: "256,256"  # smaller decoder to encourage reliance on z
   tcn_channels: "256,256,256,256,256"  # 5 layers: receptive field ~125 steps
   tcn_kernel_size: 3
   tcn_dropout: 0.0

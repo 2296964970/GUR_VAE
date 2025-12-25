@@ -6,6 +6,12 @@ import torch
 import math
 
 
+def softplus_inverse(value: float, eps: float = 1e-6) -> float:
+    """Inverse of softplus for positive scalar values with epsilon floor."""
+    v = max(float(value), eps)
+    return float(math.log(math.expm1(v)))
+
+
 def parse_sizes(s: str) -> Tuple[int, ...]:
     if not s:
         return tuple()
@@ -35,7 +41,7 @@ def validate_bth(x: torch.Tensor, name: str = 'x') -> Tuple[int, int, int]:
     B, T, H = x.shape
     return int(B), int(T), int(H)
 
-__all__ = ['parse_sizes', 'resolve_device', 'first_batch_or_exit']
+__all__ = ['parse_sizes', 'resolve_device', 'first_batch_or_exit', 'softplus_inverse']
 
 
 def _sample_laplace(shape: torch.Size, scale: float, *, generator: torch.Generator, dtype: torch.dtype) -> torch.Tensor:

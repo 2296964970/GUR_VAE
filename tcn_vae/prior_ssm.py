@@ -7,10 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
-def _softplus_inverse(value: float, eps: float = 1e-6) -> float:
-    v = max(float(value), eps)
-    return math.log(math.expm1(v))
+from .utils import softplus_inverse
 
 
 class SSMPrior(nn.Module):
@@ -68,8 +65,8 @@ class SSMPrior(nn.Module):
             raw_A.diagonal().fill_(raw_diag)
         self.raw_A = nn.Parameter(raw_A)
 
-        raw_q_init = _softplus_inverse(q_init)
-        raw_P0_init = _softplus_inverse(P0_init)
+        raw_q_init = softplus_inverse(q_init)
+        raw_P0_init = softplus_inverse(P0_init)
         self.raw_q = nn.Parameter(torch.full((self.D,), raw_q_init, device=dev, dtype=dt))
         self.m0 = nn.Parameter(torch.full((self.D,), float(m0_init), device=dev, dtype=dt))
         self.raw_P0 = nn.Parameter(torch.full((self.D,), raw_P0_init, device=dev, dtype=dt))

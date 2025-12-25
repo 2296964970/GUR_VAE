@@ -4,10 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
-def _softplus_inverse(value: float, eps: float = 1e-6) -> float:
-    v = max(float(value), eps)
-    return float(torch.log(torch.expm1(torch.tensor(v))).item())
+from .utils import softplus_inverse
 
 
 class GaussianDecoder(nn.Module):
@@ -56,7 +53,7 @@ class GaussianDecoder(nn.Module):
         with torch.no_grad():
             # target variance = exp(init_logvar)
             target_var = float(torch.exp(torch.tensor(float(init_logvar))).item())
-            raw_init = _softplus_inverse(target_var, eps=self.eps)
+            raw_init = softplus_inverse(target_var, eps=self.eps)
             if out.bias is not None:
                 # Second half bias corresponds to raw_var
                 out.bias[self.output_dim:].fill_(raw_init)

@@ -1,4 +1,4 @@
-**Branch Note:** The experimental-playground branch is reserved for experimental ideas and may introduce large structural changes.
+
 
 # Agent Constraints and Guidelines
 
@@ -62,12 +62,12 @@ State estimation underlies operational decision making in modern power systems, 
 
 ## Current Project Description
 
-The repository implements an end-to-end TCN-Variational Autoencoder pipeline tailored to IEEE benchmark grids. Training now uses normal-only data with on-the-fly FDIA injection, while inference still uses paired (attacked/normal) data with strict timestamp alignment. Data utilities in `tcn_vae/data.py` provide:
+The repository implements an end-to-end TCN-Variational Autoencoder pipeline tailored to IEEE benchmark grids. Training now uses normal-only data with on-the-fly FDIA injection. Downstream evaluation or inference drivers are not shipped in this repository but can be built on top of the core library if needed. Data utilities in `tcn_vae/data.py` provide:
 
-- `load_paired_timeseries(normal_csv, attacked_csv)`: validates identical headers, shapes, timestamps, and observability masks (used for inference evaluation).
+- `load_paired_timeseries(normal_csv, attacked_csv)`: validates identical headers, shapes, timestamps, and observability masks for paired normal/attacked series.
 - `create_normal_loaders(...)`: builds sliding-window datasets from normal-only data; the trainer injects per-step sparse FDIA noise on observed positions during training/validation and learns to reconstruct the clean targets.
 
-Training optimizes a causal TCN encoder + Gaussian decoder with KL regularization. The supervised ELBO uses observed-only reconstruction loss: only positions marked observable contribute to the negative log-likelihood. Inference reconstructs attacked sequences over the full series and reports observed-space metrics against the aligned normal slice. A single `config.yaml` controls data paths, training windowing, model hyperparameters, training schedule, and inference paths.
+Training optimizes a causal TCN encoder + Gaussian decoder with KL regularization. The supervised ELBO uses observed-only reconstruction loss: only positions marked observable contribute to the negative log-likelihood. A single `config.yaml` controls data paths, training windowing, model hyperparameters, training schedule, and inference paths.
 
 ## Experimental Scope
 Experiments are conducted on three benchmark power system models: IEEE14, IEEE57, and IEEE118. For each system, five datasets provide complementary perspectives on normal operation, attacked measurements, and idealized ground-truth labels.
@@ -92,12 +92,11 @@ To prevent leakage across calendar periods while supporting supervised reconstru
 - Inference data (2025/09, do NOT use for training)
   - Normal pattern (example): `input/{case}/infer/*_2025-09_clean_noisy.csv`
   - Attacked pattern (example): `input/{case}/infer/*_fdia_2025-09_noisy.csv`
-  - Inference reconstructs the full attacked series and evaluates metrics against the aligned normal slice on observed positions only.
 
 Enforcement guidance
 - Training uses `tcn_vae/data.py:create_normal_loaders`, which expects a normal CSV for 07–08; FDIA is injected by the trainer per time step with a fixed sparse rate on observed features (no configuration switch for the rate).
 - Configuration validation in `tcn_vae/config.py:_validate_training_policy` forbids any `2025-09` paths in training and forbids `fdia` in the training normal CSV.
-- Paired CSV alignment and masking equality checks apply to inference only via `load_paired_timeseries`.
+- Paired CSV alignment and masking equality checks are implemented in `tcn_vae/data.py:load_paired_timeseries` for any evaluation that uses paired normal and attacked CSVs.
 
 Rationale
 - Normal-only training with per-step FDIA injection enables learning of nominal trajectories without relying on attacked training files, while evaluation remains isolated to the 2025/09 period using paired data. Observed-only losses avoid penalizing unobserved entries.
