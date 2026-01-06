@@ -1,7 +1,11 @@
-import torch
-from tcn_vae.metrics import gaussian_nll_observed, mse_missing, mse_observed
-from tcn_vae.data import PairedSlidingWindowDataset
 import numpy as np
+import pandas as pd
+import pytest
+import torch
+
+from LGSSM_VAE.foundation.errors import DataError
+from LGSSM_VAE.foundation.metrics import gaussian_nll_observed, mse_missing, mse_observed
+from LGSSM_VAE.data import PairedSlidingWindowDataset, load_paired_timeseries
 
 
 def test_metrics_mask_semantics():
@@ -30,3 +34,30 @@ def test_paired_dataset_tuple_shapes():
     assert xa_w.shape == (8, H)
     assert m_w.shape == (8, H)
     assert xn_w.shape == (8, H)
+
+
+def test_load_paired_timeseries_rejects_mismatched_headers(tmp_path):
+    normal_csv = tmp_path / "normal.csv"
+    attacked_csv = tmp_path / "attacked.csv"
+
+    df_normal = pd.DataFrame(
+        {
+            "ts": ["2025/09/15 00:00", "2025/09/15 00:05"],
+            "a": [1.0, 2.0],
+            "b": [3.0, 4.0],
+        }
+    )
+    df_attacked = pd.DataFrame(
+        {
+            "ts": ["2025/09/15 00:00", "2025/09/15 00:05"],
+            "a": [1.0, 2.0],
+            "c": [3.0, 4.0],
+        }
+    )
+
+    df_normal.to_csv(normal_csv, index=False)
+    df_attacked.to_csv(attacked_csv, index=False)
+
+    with pytest.raises(DataError) as exc:
+        load_paired_timeseries(str(normal_csv), str(attacked_csv))
+    assert "特征列不一致" in str(exc.value)

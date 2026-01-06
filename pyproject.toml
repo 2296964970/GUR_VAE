@@ -3,7 +3,7 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "tcn-vae"
+name = "LGSSM-VAE"
 version = "0.1.0"
 requires-python = ">=3.9"
 dependencies = [
@@ -13,8 +13,11 @@ dependencies = [
   "PyYAML"
 ]
 authors = [{name="Research Team"}]
-description = "Online TCN-VAE for FDIA repair"
+description = "Online LGSSM-VAE for FDIA repair"
 readme = "README.md"
 
-[tool.setuptools]
-packages = ["tcn_vae"]
+[tool.setuptools.packages.find]
+include = ["LGSSM_VAE*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

@@ -5,9 +5,11 @@ import numpy as np
 import pandas as pd
 import torch
 
-from tcn_vae.config import load_config
-from tcn_vae.inference import run_range_inference, RangeInferOutput
-from tcn_vae.utils import resolve_device
+from LGSSM_VAE.config import load_config
+from LGSSM_VAE.foundation.errors import LGSSMVAEError
+from LGSSM_VAE.foundation.utils import resolve_device
+from LGSSM_VAE.data import load_timeseries_frame
+from LGSSM_VAE.pipeline import RangeInferOutput, run_range_inference
 
 
 def _format_time_for_filename(start_str: str, end_str: str) -> str:
@@ -18,53 +20,91 @@ def _format_time_for_filename(start_str: str, end_str: str) -> str:
     return f"{a}_to_{b}"
 
 
-def _save_range_outputs(
-    out: RangeInferOutput,
+def _slice_by_timestamps(df: pd.DataFrame, *, ts_col: str, ts: pd.Series) -> pd.DataFrame:
+    if df[ts_col].duplicated().any():
+        raise SystemExit(f"[错误] CSV 时间戳重复: {ts_col}")
+    key = pd.DataFrame({ts_col: ts.astype(str).reset_index(drop=True)})
+    out = key.merge(df, on=ts_col, how="left", indicator=True)
+    missing = out["_merge"] != "both"
+    if bool(missing.any()):
+        n_missing = int(missing.sum())
+        t0 = str(out.loc[missing, ts_col].iloc[0])
+        raise SystemExit(f"[错误] 输入CSV缺少推理输出对应时间戳：missing={n_missing}, first={t0}")
+    return out.drop(columns=["_merge"])
+
+
+def _save_outputs(
     *,
+    out_attacked: RangeInferOutput,
+    out_normal: RangeInferOutput,
     base_dir: str,
+    cfg,
     case: str,
-    series: str,
     start_time: str,
     end_time: str,
 ) -> None:
     os.makedirs(base_dir, exist_ok=True)
+
+    df_attack, ts_col, _ = load_timeseries_frame(str(cfg.infer.attacked_csv))
+    df_normal, ts_col_n, _ = load_timeseries_frame(str(cfg.infer.normal_csv))
+    if ts_col_n != ts_col:
+        raise SystemExit("[错误] infer.normal_csv 与 infer.attacked_csv 时间戳列名不一致")
+
+    ts = out_attacked.timestamps.reset_index(drop=True).astype(str)
+    ts_normal = out_normal.timestamps.reset_index(drop=True).astype(str)
+    if not ts.equals(ts_normal):
+        raise SystemExit("[错误] normal 与 attacked 推理输出时间戳不一致，无法同时导出CSV")
+
+    df_attack_slice = _slice_by_timestamps(df_attack, ts_col=ts_col, ts=ts)
+    df_normal_slice = _slice_by_timestamps(df_normal, ts_col=ts_col, ts=ts)
+    feature_cols = [c for c in df_attack_slice.columns if c != ts_col]
+
+    normal_infer_path = str(cfg.infer.normal_csv).strip()
+    attacked_infer_path = str(cfg.infer.attacked_csv).strip()
+    n_base, n_ext = os.path.splitext(os.path.basename(normal_infer_path))
+    a_base, a_ext = os.path.splitext(os.path.basename(attacked_infer_path))
+    ext = n_ext or a_ext or ".csv"
+
     tag = _format_time_for_filename(start_time, end_time)
-    series = series.lower().strip()
+    fallback_normal = f"{case}_normal_clean_{tag}{ext}"
+    fallback_attack = f"{case}_attack_clean_{tag}{ext}"
+    fallback_normal_repaired = f"{case}_normal_repaired_clean_{tag}{ext}"
+    fallback_attack_repaired = f"{case}_attack_repaired_clean_{tag}{ext}"
 
-    # Reconstructed (blended) series
-    recon_path = os.path.join(
-        base_dir,
-        f"{case}_{series}_recon_{tag}.csv",
-    )
+    normal_name = f"{n_base}{ext}" if n_base else fallback_normal
+    attack_name = f"{a_base}{ext}" if a_base else fallback_attack
+    if f"{case}_normal_" in n_base:
+        normal_repaired_name = f"{n_base.replace(f'{case}_normal_', f'{case}_normal_repaired_', 1)}{ext}"
+    elif "_normal_" in n_base:
+        normal_repaired_name = f"{n_base.replace('_normal_', '_normal_repaired_', 1)}{ext}"
+    else:
+        normal_repaired_name = fallback_normal_repaired
+    if f"{case}_attack_" in a_base:
+        attack_repaired_name = f"{a_base.replace(f'{case}_attack_', f'{case}_attack_repaired_', 1)}{ext}"
+    elif "_attack_" in a_base:
+        attack_repaired_name = f"{a_base.replace('_attack_', '_attack_repaired_', 1)}{ext}"
+    else:
+        attack_repaired_name = fallback_attack_repaired
 
-    ts = out.timestamps.reset_index(drop=True)
-    N, H = out.recon_blend.shape
+    attacked_normal_path = os.path.join(base_dir, normal_name)
+    attacked_attack_path = os.path.join(base_dir, attack_name)
+    attacked_repaired_path = os.path.join(base_dir, attack_repaired_name)
+    normal_repaired_path = os.path.join(base_dir, normal_repaired_name)
 
-    # Reconstructed series: timestamp + H features
-    df_recon = pd.DataFrame(out.recon_blend.copy())
-    df_recon.insert(0, "timestamp", ts.astype(str))
-    df_recon.to_csv(recon_path, index=False)
+    df_attacked_repair = pd.DataFrame(out_attacked.recon_blend.copy(), columns=feature_cols)
+    df_attacked_repair.insert(0, ts_col, ts)
+    df_normal_repair = pd.DataFrame(out_normal.recon_blend.copy(), columns=feature_cols)
+    df_normal_repair.insert(0, ts_col, ts)
 
-    # Optional per-step RMSE vs clean (for normal/attacked with ground truth)
-    if out.rmse_vs_clean is not None:
-        rmse_path = os.path.join(
-            base_dir,
-            f"{case}_{series}_rmse_{tag}.tsv",
-        )
-        idx = np.arange(N, dtype=np.int64)
-        data = {
-            "idx": idx,
-            "timestamp": ts.astype(str),
-            "rmse_repair": out.rmse_vs_clean.astype(np.float32),
-        }
-        if out.rmse_obs_vs_clean is not None:
-            data["rmse_obs"] = out.rmse_obs_vs_clean.astype(np.float32)
-        df_rmse = pd.DataFrame(data)
-        df_rmse.to_csv(rmse_path, sep="\t", index=False)
+    df_attacked_repair.to_csv(attacked_repaired_path, index=False)
+    df_normal_slice.to_csv(attacked_normal_path, index=False)
+    df_attack_slice.to_csv(attacked_attack_path, index=False)
+    df_normal_repair.to_csv(normal_repaired_path, index=False)
 
-    print(f"  已保存: {recon_path}")
-    if out.rmse_vs_clean is not None:
-        print(f"  已保存: {rmse_path}")
+    print(f"  已保存: {attacked_repaired_path}")
+    print(f"  已保存: {attacked_normal_path}")
+    print(f"  已保存: {attacked_attack_path}")
+    print(f"  已保存: {normal_repaired_path}")
 
 
 def _print_basic_summary(out: RangeInferOutput, *, series: str) -> None:
@@ -95,8 +135,8 @@ def _print_basic_summary(out: RangeInferOutput, *, series: str) -> None:
 def _print_attacked_metrics(att_out: RangeInferOutput, top_k: int = 20) -> None:
     """攻击序列的精简指标:
 
-    - 修复变差比例: RMSE_repair > RMSE_before 的时间步比例
-    - Top-K 最佳修复: 按修复比例 (before-after)/before 排序
+    - Repair Worsened Fraction: post-repair RMSE > pre-repair RMSE
+    - Top-K Best Repairs: sort by relative improvement (pre - post) / pre
     """
     rmse_before = att_out.rmse_obs_vs_clean
     rmse_repair = att_out.rmse_vs_clean
@@ -118,10 +158,10 @@ def _print_attacked_metrics(att_out: RangeInferOutput, top_k: int = 20) -> None:
     worse = (repair > before) & valid
     frac_worse = float(worse.sum() / n_valid)
     print(f"\n{'─'*60}")
-    print("  攻击序列对比指标")
+    print("  Attacked-Series Metrics")
     print(f"{'─'*60}")
     print(
-        f"  修复变差比例 (RMSE_修复 > RMSE_攻击前): "
+        f"  Repair Worsened Fraction (Post-Repair RMSE > Pre-Repair RMSE): "
         f"{frac_worse:.2%} ({int(worse.sum())}/{n_valid})"
     )
 
@@ -140,9 +180,9 @@ def _print_attacked_metrics(att_out: RangeInferOutput, top_k: int = 20) -> None:
     top_idx = np.nonzero(finite)[0][order[: int(top_k)]]
 
     print()
-    print("  前20个修复效果最好的时间步（按修复比例从高到低）:")
-    print("  修复比例 = (RMSE_攻击前 - RMSE_修复后) / RMSE_攻击前")
-    print(f"  {'序号':>4} {'时间戳':<18} {'攻击前RMSE':>12} {'修复后RMSE':>12} {'修复比例':>10}")
+    print("  Top-20 Best-Repaired Timesteps (sorted by Improvement Ratio):")
+    print("  Improvement Ratio = (Pre-Repair RMSE - Post-Repair RMSE) / Pre-Repair RMSE")
+    print(f"  {'Rank':>4} {'Timestamp':<18} {'Pre-Repair RMSE':>14} {'Post-Repair RMSE':>15} {'Improvement':>11}")
     print(f"  {'-'*64}")
     ts = att_out.timestamps.reset_index(drop=True)
     for rank, j in enumerate(top_idx, start=1):
@@ -150,12 +190,86 @@ def _print_attacked_metrics(att_out: RangeInferOutput, top_k: int = 20) -> None:
         b = float(before[int(j)])
         r = float(repair[int(j)])
         rr = float(ratio[int(j)])
-        print(f"  {rank:>4d} {ts_j:<18} {b:>12.4f} {r:>12.4f} {rr:>9.2%}")
+        print(f"  {rank:>4d} {ts_j:<18} {b:>14.4f} {r:>15.4f} {rr:>10.2%}")
+
+
+def _print_normal_overrepair_metrics(
+    out: RangeInferOutput,
+    *,
+    rmse_threshold: float,
+    top_k: int = 20,
+) -> None:
+    """Normal-series over-repair diagnostics.
+
+    Over-repair here means the repaired (blended) output deviates from the
+    original observation on observed entries.
+    """
+    rmse_change = out.rmse_change_vs_obs
+    if not isinstance(rmse_change, np.ndarray):
+        print("  [警告] 正常序列缺少 over-repair 向量，无法统计")
+        return
+
+    x = rmse_change.astype(np.float64)
+    valid = np.isfinite(x)
+    n_valid = int(valid.sum())
+    if n_valid == 0:
+        print("  [警告] 无有效 over-repair 时间步")
+        return
+
+    thr = float(rmse_threshold)
+    over = valid & (x > thr)
+    frac_over = float(over.sum() / n_valid)
+
+    p50 = float(np.nanpercentile(x, 50))
+    p90 = float(np.nanpercentile(x, 90))
+    p99 = float(np.nanpercentile(x, 99))
+    mx = float(np.nanmax(x))
+
+    print(f"\n{'─'*60}")
+    print("  Normal-Series Over-Repair Diagnostics")
+    print(f"{'─'*60}")
+    print(
+        "  Change RMSE (Repaired vs Observed) Percentiles: "
+        f"p50={p50:.6f}, p90={p90:.6f}, p99={p99:.6f}, max={mx:.6f}"
+    )
+    if thr > 0.0:
+        print(
+            f"  Over-Repair Fraction (Change RMSE > {thr:g}): {frac_over:.2%} "
+            f"({int(over.sum())}/{n_valid})"
+        )
+
+    order = np.argsort(x[valid])[::-1]
+    top_idx = np.nonzero(valid)[0][order[: int(top_k)]]
+
+    ts = out.timestamps.reset_index(drop=True)
+    w = out.mean_weight_obs
+    z = out.mean_abs_change_over_sigma
+
+    print()
+    print("  Top-20 Most Over-Repaired Timesteps (sorted by Change RMSE):")
+    if isinstance(w, np.ndarray) and isinstance(z, np.ndarray):
+        print(
+            f"  {'Rank':>4} {'Timestamp':<18} {'Change RMSE':>12} "
+            f"{'Mean Obs Weight':>15} {'Mean |Δ|/σ':>12}"
+        )
+        print(f"  {'-'*68}")
+        for rank, j in enumerate(top_idx, start=1):
+            ts_j = str(ts.iloc[int(j)])
+            print(
+                f"  {rank:>4d} {ts_j:<18} {float(x[int(j)]):>12.6f} "
+                f"{float(w[int(j)]):>15.4f} {float(z[int(j)]):>12.4f}"
+            )
+    else:
+        print(f"  {'Rank':>4} {'Timestamp':<18} {'Change RMSE':>12}")
+        print(f"  {'-'*40}")
+        for rank, j in enumerate(top_idx, start=1):
+            ts_j = str(ts.iloc[int(j)])
+            print(f"  {rank:>4d} {ts_j:<18} {float(x[int(j)]):>12.6f}")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="TCN-VAE 时间范围推理"
+        description="LGSSM-VAE 时间范围推理"
     )
     parser.add_argument(
         "--start",
@@ -166,37 +280,32 @@ def main() -> None:
         help='结束时间，如 "2025-09-20 00:00"',
     )
     parser.add_argument(
-        "--series",
-        choices=["normal", "attacked", "both"],
-        help="推理序列: normal(正常), attacked(攻击), both(两者)",
+        "--overrepair-thr",
+        type=float,
+        default=0.0,
+        help="正常序列过修复阈值：RMSE(修复后 vs 输入观测) > thr 记为过修复；0 表示不做阈值统计",
     )
 
     args = parser.parse_args()
     cfg = load_config()
 
-    start_time = args.start or getattr(cfg, "infer_start", "").strip()
-    end_time = args.end or getattr(cfg, "infer_end", "").strip()
-    series_cfg = getattr(cfg, "infer_series", "both")
-    series_arg = args.series or series_cfg
-    series_opt = str(series_arg).strip().lower() if series_arg is not None else "both"
-
-    if series_opt not in ("normal", "attacked", "both"):
-        raise SystemExit(f"[错误] 无效序列 '{series_opt}'，可选: normal, attacked, both")
+    start_time = args.start or str(cfg.infer.start).strip()
+    end_time = args.end or str(cfg.infer.end).strip()
     if not start_time or not end_time:
         raise SystemExit("[错误] 请指定 --start 和 --end 时间")
 
-    device = resolve_device(getattr(cfg, "device", "cpu"))
+    device = resolve_device(cfg.train.device)
     infer_root = os.path.join("output", cfg.case, "infer")
-    save_outputs = bool(getattr(cfg, "infer_save_outputs", False))
+    save_outputs = bool(cfg.infer.save_outputs)
 
-    series_list = ["normal", "attacked"] if series_opt == "both" else [series_opt]
+    series_list = ["normal", "attacked"]
 
     print(f"\n{'═'*60}")
-    print(f"  TCN-VAE 推理")
+    print(f"  LGSSM-VAE 推理")
     print(f"{'═'*60}")
     print(f"  案例: {cfg.case}")
     print(f"  时间: {start_time} ~ {end_time}")
-    print(f"  序列: {series_opt}")
+    print("  序列: normal + attacked")
 
     outputs: dict[str, RangeInferOutput] = {}
 
@@ -211,20 +320,32 @@ def main() -> None:
         _print_basic_summary(out, series=s)
         outputs[s] = out
 
-        if save_outputs:
-            _save_range_outputs(
-                out,
-                base_dir=infer_root,
-                case=str(cfg.case),
-                series=s,
-                start_time=start_time,
-                end_time=end_time,
-            )
+    if save_outputs:
+        if "normal" not in outputs or "attacked" not in outputs:
+            raise SystemExit("[错误] 推理输出缺失，无法导出CSV")
+        _save_outputs(
+            out_attacked=outputs["attacked"],
+            out_normal=outputs["normal"],
+            base_dir=infer_root,
+            cfg=cfg,
+            case=str(cfg.case),
+            start_time=start_time,
+            end_time=end_time,
+        )
 
     # Print simplified attacked-only comparison metrics.
     if "attacked" in outputs:
         _print_attacked_metrics(outputs["attacked"], top_k=20)
+    if "normal" in outputs:
+        _print_normal_overrepair_metrics(
+            outputs["normal"],
+            rmse_threshold=float(args.overrepair_thr),
+            top_k=20,
+        )
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except LGSSMVAEError as e:
+        raise SystemExit(str(e)) from None

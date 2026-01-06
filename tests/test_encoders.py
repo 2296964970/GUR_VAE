@@ -1,5 +1,5 @@
 import torch
-from tcn_vae.encoders import CausalTCNEncoder
+from LGSSM_VAE.modeling.encoders import CausalTCNEncoder
 
 
 def test_tcn_encoder_shapes():

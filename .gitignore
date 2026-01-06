@@ -2,7 +2,7 @@
 input/
 
 # 模型输出
-models/
+/models/
 *.pt
 *.pth
 *.ckpt
@@ -21,6 +21,9 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.so
+.pytest_cache/
+.serena/
+$null
 
 # 虚拟环境
 venv/

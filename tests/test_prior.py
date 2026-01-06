@@ -1,5 +1,5 @@
 import torch
-from tcn_vae.prior_ssm import SSMPrior
+from LGSSM_VAE.modeling.prior_ssm import SSMPrior
 
 
 def test_ssm_prior_shapes_and_kl():

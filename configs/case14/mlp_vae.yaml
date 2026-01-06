@@ -1,0 +1,31 @@
+global:
+  case: case14
+
+# 用户常改/常调参数（其余参数使用代码默认值即可）
+train:
+  normal_csv: input/case14/train/case14_normal_clean_2025-07_2025-08.csv
+  model_dir: output/case14/models/mlp_vae_default
+  device: cuda
+  seed: 1337
+  learning_rate: 3.0e-4
+  phase1_epochs: 18
+  phase2_epochs: 42
+  warmup_frac: 0.2
+  anchor_lambda: 3.0
+
+infer:
+  normal_csv: input/case14/infer/case14_normal_clean_2025-09.csv
+  attacked_csv: input/case14/infer/case14_attack_clean_2025-09.csv
+  ckpt: output/case14/models/mlp_vae_default/ckpt.pt
+
+window:
+  time_length: 96
+  stride: 24
+  batch_size: 64
+  num_workers: 0
+
+model:
+  name: mlp_vae
+  latent_dim: 64
+  beta: 0.5
+  dec_hidden: [256, 256]

@@ -1,0 +1,33 @@
+global:
+  case: case57
+
+# 用户常改/常调参数（其余参数使用代码默认值即可）
+train:
+  normal_csv: input/case57/train/case57_normal_clean_2025-07_2025-08.csv
+  model_dir: output/case57/models/tcn_default
+  device: cuda
+  seed: 1337
+  learning_rate: 3.0e-4
+  phase1_epochs: 18
+  phase2_epochs: 42
+  warmup_frac: 0.2
+  anchor_lambda: 3.0
+
+infer:
+  normal_csv: input/case57/infer/case57_normal_clean_2025-09.csv
+  attacked_csv: input/case57/infer/case57_attack_clean_2025-09.csv
+  ckpt: output/case57/models/tcn_default/ckpt.pt
+  fixed_sigma_std: 0.5
+  disable_blend: false
+
+window:
+  time_length: 96
+  stride: 24
+  batch_size: 64
+  num_workers: 0
+
+model:
+  name: TCN
+  tcn_channels: [256, 256, 256, 256, 256]
+  tcn_kernel_size: 3
+  tcn_dropout: 0.0

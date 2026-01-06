@@ -1,0 +1,33 @@
+global:
+  case: case118
+
+# 用户常改/常调参数（其余参数使用代码默认值即可）
+train:
+  normal_csv: input/case118/train/case118_normal_clean_2025-07_2025-08.csv
+  model_dir: output/case118/models/lstm_default
+  device: cuda
+  seed: 1337
+  learning_rate: 3.0e-4
+  phase1_epochs: 15
+  phase2_epochs: 45
+  warmup_frac: 0.4
+  anchor_lambda: 3.0
+
+infer:
+  normal_csv: input/case118/infer/case118_normal_clean_2025-09.csv
+  attacked_csv: input/case118/infer/case118_attack_clean_2025-09.csv
+  ckpt: output/case118/models/lstm_default/ckpt.pt
+  fixed_sigma_std: 0.5
+  disable_blend: false
+
+window:
+  time_length: 96
+  stride: 24
+  batch_size: 64
+  num_workers: 0
+
+model:
+  name: LSTM
+  lstm_hidden_size: 256
+  lstm_num_layers: 1
+  lstm_dropout: 0.0
